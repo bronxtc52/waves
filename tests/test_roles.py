@@ -168,6 +168,54 @@ class TestLaunchArgv(LaunchEnv):
         self.assertEqual(self.sh_calls, [])
 
 
+class TestRefusalDropsCache(LaunchEnv):
+    """После отказа в state нет кэша проверок и эффективных ролей: следующий запуск проверяет заново."""
+
+    KEYS = ("models", "roles_effective", "role_fallbacks")
+
+    def _ok_then_all_down(self):
+        self.probe.side_effect = lambda m, *a, **k: (True, "rc=0")
+        wab.ensure_roles(self.cfg, refresh=True)
+        self.assertIn("models", wab.load_state(self.cfg))
+        self.probe.side_effect = lambda m, *a, **k: (False, "rc=1")
+
+    def test_ensure_roles_refusal_drops_cache_and_launch_rechecks(self):
+        self._ok_then_all_down()
+        with self.assertRaises(SystemExit):
+            wab.ensure_roles(self.cfg, refresh=True)
+        st = wab.load_state(self.cfg)
+        for k in self.KEYS:
+            self.assertNotIn(k, st)
+        n = self.probe.call_count
+        with mock.patch.object(wab, "prepare_worktree") as pw:
+            with self.assertRaises(SystemExit):
+                wab.launch(self.cfg, "W1", str(self.prompt))
+        self.assertGreater(self.probe.call_count, n)
+        pw.assert_not_called()
+        self.assertEqual(self.sh_calls, [])
+
+    def test_resolve_roles_refusal_drops_keys_in_memory(self):
+        st = {"waves": {}}
+        wab.resolve_roles(self.cfg, st, probe=lambda m, *a, **k: (True, "rc=0"))
+        self.assertIn("models", st)
+        for info in st["models"].values():
+            info["ok"] = False       # кэш устарел: модели пропали
+        with self.assertRaises(SystemExit):
+            wab.resolve_roles(self.cfg, st, probe=lambda m, *a, **k: (False, "rc=1"))
+        for k in self.KEYS:
+            self.assertNotIn(k, st)
+
+    def test_event_text_when_fallback_model_itself_down(self):
+        self.probe.side_effect = lambda m, *a, **k: (False, "rc=1")
+        with self.assertRaises(SystemExit):
+            wab.ensure_roles(self.cfg)
+        ev = [e for e in self.events if e.startswith("модель opus")]
+        self.assertEqual(len(ev), 1)
+        self.assertIn("fallback_model совпадает", ev[0])
+        self.assertIn("запуск невозможен", ev[0])
+        self.assertNotIn("→ fallback opus", ev[0])
+
+
 class TestModelsCommand(LaunchEnv):
     def run_models(self, *extra):
         out = io.StringIO()

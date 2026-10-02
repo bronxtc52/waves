@@ -702,13 +702,23 @@ def apply_notices(cfg, st, result):
         elif model not in notices:
             notices[model] = info["detail"]
             users = ", ".join(r for r, m in roles.items() if m == model)
-            event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users} → fallback {fb}")
+            if model == fb:
+                event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users}, "
+                           f"fallback_model совпадает — запуск невозможен")
+            else:
+                event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users} → fallback {fb}")
 
 
 def _store_roles(st, result):
     st["models"] = result["models"]
     st["roles_effective"] = result["effective"]
     st["role_fallbacks"] = result["fallbacks"]
+
+
+def _drop_roles(st):
+    """Отказ: кэша проверок и эффективных ролей в state не остаётся (отметки model_notices — остаются)."""
+    for k in ("models", "roles_effective", "role_fallbacks"):
+        st.pop(k, None)
 
 
 def resolve_roles(cfg, st, probe=None):
@@ -720,6 +730,7 @@ def resolve_roles(cfg, st, probe=None):
     r = probe_roles(cfg, st.get("models"), probe)
     apply_notices(cfg, st, r)
     if r["error"]:
+        _drop_roles(st)
         raise SystemExit(r["error"])
     _store_roles(st, r)
     return r["effective"]
@@ -738,6 +749,7 @@ def ensure_roles(cfg, refresh=False):
         cur = load_state(cfg)
         apply_notices(cfg, cur, r)
         if r["error"]:
+            _drop_roles(cur)
             save_state(cfg, cur)
             raise SystemExit(r["error"])
         _store_roles(cur, r)
