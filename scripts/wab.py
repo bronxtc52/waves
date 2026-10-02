@@ -204,8 +204,11 @@ def _git(checkout, *args):
 def prepare_worktree(cfg, wave):
     """Готовит git worktree волны и возвращает его путь.
 
-    `checkout` из конфига обязан быть корнем git-checkout. Worktree создаётся от
-    origin/<base_branch> в ветке wab/<chain>/<wave>; уже зарегистрированный — переиспользуется.
+    `checkout` из конфига обязан быть корнем git-checkout. Ветка волны — wab/<chain>/<run_id>/<wave>:
+    новый прогон получает новую ветку от свежего origin/<base_branch>. Уже зарегистрированный
+    worktree переиспользуется; если каталог пропал (или worktree удалён), а ветка осталась,
+    worktree восстанавливается на той же ветке со всеми её коммитами. Ветка, занятая другим
+    worktree, — SystemExit.
     """
     checkout = pathlib.Path(cfg["checkout"])
     r = _git(checkout, "rev-parse", "--show-toplevel")
@@ -217,25 +220,44 @@ def prepare_worktree(cfg, wave):
                          f"укажите в waves.json корень")
 
     wt = (cfg["run_dir"] / "worktrees" / wave).resolve()
-    listing = _git(checkout, "worktree", "list", "--porcelain")
-    if listing.returncode != 0:
-        raise SystemExit(f"git worktree list: {listing.stderr.strip()}")
-    registered = {pathlib.Path(l[len("worktree "):]).resolve()
-                  for l in listing.stdout.splitlines() if l.startswith("worktree ")}
+    branch = f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
+
+    def listing():
+        r = _git(checkout, "worktree", "list", "--porcelain")
+        if r.returncode != 0:
+            raise SystemExit(f"git worktree list: {r.stderr.strip()}")
+        paths = {}
+        cur = None
+        for l in r.stdout.splitlines():
+            if l.startswith("worktree "):
+                cur = pathlib.Path(l[len("worktree "):]).resolve()
+                paths[cur] = None
+            elif l.startswith("branch ") and cur is not None:
+                paths[cur] = l[len("branch "):]
+        return paths
+
+    registered = listing()
     if wt in registered and wt.is_dir():
         return str(wt)
-    if wt in registered:  # запись есть, каталога нет: чистим и создаём заново
+    if wt in registered:  # запись есть, каталога нет: чистим запись
         _git(checkout, "worktree", "prune")
+        registered = listing()
     elif wt.exists():
         raise SystemExit(f"{wt} уже существует, но не является worktree этого репозитория")
+    for path, ref in registered.items():
+        if ref == f"refs/heads/{branch}":
+            raise SystemExit(f"ветка {branch} занята: она уже выбрана в worktree {path}")
 
-    base = cfg["base_branch"]
-    r = _git(checkout, "fetch", "origin", base)
-    if r.returncode != 0:
-        raise SystemExit(f"git fetch origin {base}: {r.stderr.strip()}")
     wt.parent.mkdir(parents=True, exist_ok=True)
-    branch = f"wab/{cfg['chain']}/{wave}"
-    r = _git(checkout, "worktree", "add", "-b", branch, str(wt), f"origin/{base}")
+    exists = _git(checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0
+    if exists:
+        r = _git(checkout, "worktree", "add", str(wt), branch)
+    else:
+        base = cfg["base_branch"]
+        r = _git(checkout, "fetch", "origin", base)
+        if r.returncode != 0:
+            raise SystemExit(f"git fetch origin {base}: {r.stderr.strip()}")
+        r = _git(checkout, "worktree", "add", "-b", branch, str(wt), f"origin/{base}")
     if r.returncode != 0:
         raise SystemExit(f"git worktree add {branch}: {r.stderr.strip()}")
     return str(wt)

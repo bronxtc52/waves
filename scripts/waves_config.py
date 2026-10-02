@@ -113,6 +113,8 @@ def _read(path):
         return name, json.loads(raw, object_pairs_hook=_no_duplicates)
     except ConfigError as e:
         raise ConfigError(f"{name}: {e}") from None
+    except RecursionError:
+        raise ConfigError(f"{name}: невалидный JSON: слишком глубокая вложенность") from None
     except ValueError as e:
         raise ConfigError(f"{name}: невалидный JSON: {e}") from None
 

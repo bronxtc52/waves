@@ -106,6 +106,12 @@ class TestFileReading(LoaderBase):
         self.assertIn("waves.json", str(cm.exception))
         self.assertIn("UTF-8", str(cm.exception))
 
+    def test_deeply_nested_json(self):
+        for raw in ("[" * 100000, '{"a":' * 100000):
+            with self.assertRaises(ConfigError) as cm:
+                load_waves(write_json(self.dir, raw))
+            self.assertIn("waves.json", str(cm.exception))
+
     def test_directory_instead_of_file(self):
         (self.dir / "waves.json").mkdir()
         with self.assertRaises(ConfigError):

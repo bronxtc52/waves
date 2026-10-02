@@ -76,7 +76,7 @@ class TestPrepareWorktree(unittest.TestCase):
         expected = self.cfg["run_dir"] / "worktrees" / "W1"
         self.assertEqual(pathlib.Path(path).resolve(), expected.resolve())
         self.assertTrue((expected / "a.txt").exists())
-        self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/W1")
+        self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/2026-10-02/W1")
         self.assertEqual(git("-C", path, "rev-parse", "HEAD"),
                          git("-C", str(self.checkout), "rev-parse", "origin/main"))
 
@@ -97,6 +97,48 @@ class TestPrepareWorktree(unittest.TestCase):
         second = wab.prepare_worktree(self.cfg, "W1")
         self.assertEqual(first, second)
         self.assertTrue(marker.exists())
+
+    def _commit_in(self, path, name):
+        (pathlib.Path(path) / name).write_text("x\n")
+        git("add", ".", cwd=path)
+        git("commit", "-m", name, cwd=path)
+        return git("-C", path, "rev-parse", "HEAD")
+
+    def test_restore_after_rm_of_directory(self):
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        shutil.rmtree(path)
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(again, path)
+        self.assertEqual(git("-C", again, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/2026-10-02/W1")
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+        self.assertTrue((pathlib.Path(again) / "mine.txt").exists())
+
+    def test_restore_after_worktree_remove(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        git("worktree", "remove", path, cwd=self.checkout)
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+        self.assertEqual(git("-C", again, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/2026-10-02/W1")
+
+    def test_new_run_id_gets_new_branch_from_origin(self):
+        first = wab.prepare_worktree(self.cfg, "W1")
+        self._commit_in(first, "mine.txt")
+        cfg2 = dict(self.cfg, run_id="r2", run_dir=self.root / "runs" / "r2")
+        second = wab.prepare_worktree(cfg2, "W1")
+        self.assertNotEqual(first, second)
+        self.assertEqual(git("-C", second, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/r2/W1")
+        self.assertEqual(git("-C", second, "rev-parse", "HEAD"),
+                         git("-C", str(self.checkout), "rev-parse", "origin/main"))
+
+    def test_branch_busy_in_another_worktree(self):
+        git("checkout", "-b", "wab/demo/2026-10-02/W1", cwd=self.checkout)
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        self.assertIn("wab/demo/2026-10-02/W1", str(cm.exception))
+        self.assertIn("занята", str(cm.exception))
 
     def test_bad_base_branch(self):
         self.cfg["base_branch"] = "nope"

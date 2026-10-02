@@ -28,14 +28,14 @@ def scan(root):
     return r.stdout.splitlines()
 
 
-def copy_tree(dst):
-    """Копия отслеживаемых и добавленных файлов репозитория в новый git-репозиторий dst."""
-    files = _git(ROOT, "ls-files", "-z", "--cached", "--others", "--exclude-standard").stdout.split("\0")
+def copy_tree(dst, src=ROOT):
+    """Копия отслеживаемых файлов репозитория src в новый git-репозиторий dst."""
+    files = _git(src, "ls-files", "-z", "--cached").stdout.split("\0")
     for rel in filter(None, files):
-        src = ROOT / rel
-        if src.is_file():
+        f = pathlib.Path(src) / rel
+        if f.is_file():
             (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst / rel)
+            shutil.copy2(f, dst / rel)
     assert _git(dst, "init", "-b", "main").returncode == 0
     assert _git(dst, "add", "-A").returncode == 0
 
@@ -67,6 +67,18 @@ class TestNoPrivateInfra(unittest.TestCase):
         _git(self.copy, "add", "scripts/blob.bin")
         hits = scan(self.copy)
         self.assertTrue(any("scripts/blob.bin" in h for h in hits), hits)
+
+    def test_copy_tree_skips_untracked(self):
+        src = pathlib.Path(self._tmp.name) / "src"
+        src.mkdir()
+        _git(src, "init", "-b", "main")
+        (src / "a.txt").write_text("ok\n")
+        _git(src, "add", "a.txt")
+        (src / "draft.txt").write_text("telegram\n")  # неотслеживаемый черновик
+        copy_tree(self.copy, src)
+        self.assertTrue((self.copy / "a.txt").exists())
+        self.assertFalse((self.copy / "draft.txt").exists())
+        self.assertEqual(scan(self.copy), [])
 
     def test_every_word_matches(self):
         copy_tree(self.copy)

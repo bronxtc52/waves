@@ -65,6 +65,12 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertNotIn("Traceback", r.stderr)
 
+    def test_validate_deeply_nested(self):
+        p = write_json(self.dir, "[" * 100000)
+        r = run("validate", str(p))
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_import_has_no_side_effects(self):
         code = ("import sys, os; sys.path.insert(0, %r); before=set(os.listdir('.')); import wab; "
                 "assert set(os.listdir('.'))==before; print('ok')" % str(ROOT / "scripts"))
