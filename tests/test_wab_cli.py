@@ -92,8 +92,8 @@ class TestCli(unittest.TestCase):
         py_compile.compile(str(ROOT / "scripts" / "dash.py"), doraise=True,
                            cfile=str(self.dir / "dash.pyc"))
 
-class TestLaunchGuards(unittest.TestCase):
-    """launch: плохой промпт не оставляет следов; не готовое окно даёт ненулевой код."""
+class LaunchMocks:
+    """Моки побочных эффектов launch (tmux, worktree, state); вызовы пишутся в self.calls."""
 
     def setUp(self):
         from unittest import mock
@@ -111,7 +111,7 @@ class TestLaunchGuards(unittest.TestCase):
             self.m[n] = pt.start()
             self.addCleanup(pt.stop)
         self.m["tmux_alive"].side_effect = lambda *a, **k: False
-        self.m["prepare_worktree"].side_effect = lambda *a, **k: str(self.dir)
+        self.m["prepare_worktree"].side_effect = lambda *a, **k: self.calls.append("prepare_worktree") or str(self.dir)
         self.m["wait_ready"].side_effect = lambda *a, **k: False
         pt = mock.patch.object(wab, "load_state", return_value={"current": None, "waves": {}})
         pt.start()
@@ -119,6 +119,10 @@ class TestLaunchGuards(unittest.TestCase):
         pt = mock.patch.object(wab, "wave_dir", return_value=self.dir)
         pt.start()
         self.addCleanup(pt.stop)
+
+
+class TestLaunchGuards(LaunchMocks, unittest.TestCase):
+    """launch: плохой промпт не оставляет следов; не готовое окно даёт ненулевой код."""
 
     def _bad_prompt(self, path):
         cfg = self.wab.load_waves(str(self.cfg_path))
@@ -157,6 +161,86 @@ class TestLaunchGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestLaunchCurrentWave(LaunchMocks, unittest.TestCase):
+    """launch: пока идёт другая волна (state.current), новая не запускается и ничего не создаётся."""
+
+    SIDE_EFFECTS = ("prepare_worktree", "sh", "save_state", "send_text", "wait_ready", "event")
+
+    def setUp(self):
+        import copy
+        from unittest import mock
+        super().setUp()
+        self.st = {"current": None, "waves": {}}
+        pt = mock.patch.object(self.wab, "load_state", side_effect=lambda *a, **k: self.st)
+        pt.start()
+        self.addCleanup(pt.stop)
+        self.copy = copy.deepcopy
+        self.cfg = self.wab.load_waves(str(self.cfg_path))
+        self.prompt = self.dir / "p.md"
+        self.prompt.write_text("задача\n", encoding="utf-8")
+        self.m["wait_ready"].side_effect = lambda *a, **k: True
+        self.wave_dir = self.wab.wave_dir
+
+    def _w1_running(self, phase):
+        name = f"{self.cfg['tmux_prefix']}w1"
+        self.st = {"current": "W1", "waves": {"W1": {"tmux": name, "cwd": str(self.dir), "started": 1.0,
+                                                     "restarts": 0, "phase": phase, "notified": {}}}}
+        return name
+
+    def _refused(self):
+        before = self.copy(self.st)
+        with self.assertRaises(SystemExit) as cm:
+            self.wab.launch(self.cfg, "W2", str(self.prompt))
+        self.assertEqual([c for c in self.calls if c in self.SIDE_EFFECTS], [])
+        self.wave_dir.assert_not_called()
+        self.assertEqual(self.st, before)
+        return str(cm.exception)
+
+    def test_other_wave_alive_refused(self):
+        name = self._w1_running("running")
+        self.m["tmux_alive"].side_effect = lambda n, *a, **k: n == name
+        msg = self._refused()
+        self.assertIn("W1", msg)
+        self.assertIn(name, msg)
+        self.assertIn("DONE", msg)
+
+    def test_other_wave_dead_refused_with_hint(self):
+        name = self._w1_running("dead")
+        msg = self._refused()
+        self.assertIn("W1", msg)
+        self.assertIn(name, msg)
+        self.assertIn("launch", msg)
+
+    def test_other_wave_not_ready_refused(self):
+        self._w1_running("not_ready")
+        msg = self._refused()
+        self.assertIn("launch", msg)
+
+    def test_no_current_launches(self):
+        self.assertTrue(self.wab.launch(self.cfg, "W2", str(self.prompt)))
+        self.assertIn("prepare_worktree", self.calls)
+        self.assertIn("sh", self.calls)
+        self.assertEqual(self.st["current"], "W2")
+
+    def test_same_wave_without_session_relaunched(self):
+        name = f"{self.cfg['tmux_prefix']}w2"
+        self.st = {"current": "W2", "waves": {"W2": {"tmux": name, "cwd": str(self.dir), "started": 1.0,
+                                                     "restarts": 0, "phase": "dead", "notified": {}}}}
+        self.assertTrue(self.wab.launch(self.cfg, "W2", str(self.prompt)))
+        self.assertIn("prepare_worktree", self.calls)
+        self.assertEqual(self.st["current"], "W2")
+        self.assertEqual(self.st["waves"]["W2"]["phase"], "running")
+
+    def test_same_wave_alive_refused(self):
+        name = f"{self.cfg['tmux_prefix']}w2"
+        self.st = {"current": "W2", "waves": {"W2": {"tmux": name, "phase": "running", "notified": {}}}}
+        self.m["tmux_alive"].side_effect = lambda n, *a, **k: n == name
+        with self.assertRaises(SystemExit) as cm:
+            self.wab.launch(self.cfg, "W2", str(self.prompt))
+        self.assertIn("уже существует", str(cm.exception))
+        self.assertNotIn("prepare_worktree", self.calls)
 
 
 class TestSurrogateCli(unittest.TestCase):

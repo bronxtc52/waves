@@ -152,6 +152,53 @@ class TestPrepareWorktree(unittest.TestCase):
         self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
         self.assertEqual(git("-C", again, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/2026-10-02/W1")
 
+    def test_recreated_empty_dir_restored(self):
+        """Каталог worktree удалён и создан заново пустым: запись в git есть, но это не рабочая копия."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        shutil.rmtree(path)
+        pathlib.Path(path).mkdir()
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(again, path)
+        self.assertEqual(git("-C", again, "rev-parse", "--show-toplevel"), path)
+        self.assertEqual(git("-C", again, "rev-parse", "--abbrev-ref", "HEAD"), "wab/demo/2026-10-02/W1")
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+        self.assertTrue((pathlib.Path(again) / "mine.txt").exists())
+
+    def test_recreated_nonempty_dir_refused_and_kept(self):
+        """Каталог создан заново и в нём чужие файлы: отказ, ничего не удаляется."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        self._commit_in(path, "mine.txt")
+        shutil.rmtree(path)
+        pathlib.Path(path).mkdir()
+        user = pathlib.Path(path) / "user.txt"
+        user.write_text("моё\n", encoding="utf-8")
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn(path, msg)
+        self.assertIn("вручную", msg)
+        self.assertEqual(user.read_text(encoding="utf-8"), "моё\n")
+        self.assertEqual(sorted(p.name for p in pathlib.Path(path).iterdir()), ["user.txt"])
+        listing = git("worktree", "list", "--porcelain", cwd=self.checkout)
+        self.assertIn(path, listing)
+
+    def test_recreated_dir_inside_other_repo_restored(self):
+        """Пустой каталог внутри чужого git-репозитория: show-toplevel даёт не wt, а внешний корень."""
+        import shutil
+        outer = self.root / "outer"
+        git("init", "-b", "main", str(outer))
+        self.cfg["run_dir"] = outer / "runs" / "r1"
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        shutil.rmtree(path)
+        pathlib.Path(path).mkdir()
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(git("-C", again, "rev-parse", "--show-toplevel"), path)
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+
     def test_new_run_id_gets_new_branch_from_origin(self):
         first = wab.prepare_worktree(self.cfg, "W1")
         self._commit_in(first, "mine.txt")

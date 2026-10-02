@@ -266,14 +266,24 @@ def _parse_worktrees_z(out):
     return paths
 
 
+def _is_worktree_of(wt, branch):
+    """Каталог — настоящая рабочая копия: корень git ровно wt, HEAD на ветке волны."""
+    r = _git(wt, "rev-parse", "--show-toplevel")
+    if r.returncode != 0 or pathlib.Path(r.stdout.removesuffix("\n")).resolve() != wt:
+        return False
+    r = _git(wt, "symbolic-ref", "--quiet", "HEAD")
+    return r.returncode == 0 and r.stdout.removesuffix("\n") == f"refs/heads/{branch}"
+
+
 def prepare_worktree(cfg, wave):
     """Готовит git worktree волны и возвращает его путь.
 
     `checkout` из конфига обязан быть корнем git-checkout. Ветка волны — wab/<chain>/<run_id>/<wave>:
     новый прогон получает новую ветку от свежего origin/<base_branch>. Уже зарегистрированный
     worktree переиспользуется; если каталог пропал (или worktree удалён), а ветка осталась,
-    worktree восстанавливается на той же ветке со всеми её коммитами. Ветка, занятая другим
-    worktree, — SystemExit.
+    worktree восстанавливается на той же ветке со всеми её коммитами; так же — если каталог
+    создан заново пустым (запись в git есть, метаданных нет). Такой же каталог с файлами —
+    SystemExit без удаления. Ветка, занятая другим worktree, — SystemExit.
     """
     checkout = pathlib.Path(cfg["checkout"])
     r = _git(checkout, "rev-parse", "--show-toplevel")
@@ -304,7 +314,13 @@ def prepare_worktree(cfg, wave):
             raise SystemExit(f"worktree {wt} стоит не на ветке волны: ожидается {branch}, "
                              f"фактически {shown}; переключите его обратно вручную "
                              f"(git -C {wt} switch {branch}), файлы и ветки не тронуты")
-        return str(wt)
+        if _is_worktree_of(wt, branch):
+            return str(wt)
+        # запись есть, но каталог создан заново обычной папкой: git-метаданных в нём нет
+        if any(wt.iterdir()):
+            raise SystemExit(f"{wt} зарегистрирован как worktree, но git-метаданных в нём нет; "
+                             f"уберите каталог вручную (файлы в нём не тронуты)")
+        wt.rmdir()  # пустой каталог ничего не хранит; дальше — восстановление на той же ветке
     if wt in registered:  # запись есть, каталога нет: чистим запись
         _git(checkout, "worktree", "prune")
         registered = listing()
@@ -345,6 +361,16 @@ def launch(cfg, wave, prompt_file):
         raise SystemExit(f"файл промпта {prompt_file} пустой")
     st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
+    cur = st.get("current")
+    if cur and cur != wave:
+        # иначе диспетчер потеряет идущую волну, а зависимые волны пойдут параллельно
+        cur_name = (st.get("waves", {}).get(cur) or {}).get("tmux") or f"{cfg['tmux_prefix']}{str(cur).lower()}"
+        msg = f"сейчас идёт волна {cur} (tmux {cur_name}); дождитесь DONE или остановите её"
+        if not tmux_alive(cur_name):
+            phase = (st.get("waves", {}).get(cur) or {}).get("phase") or "?"
+            msg += (f". Сессии {cur_name} нет (фаза {phase}): продолжите именно её — "
+                    f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
+        raise SystemExit(msg)
     if tmux_alive(name):
         raise SystemExit(f"tmux-сессия {name} уже существует")
     wdir = wave_dir(cfg, wave)
