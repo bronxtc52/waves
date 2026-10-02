@@ -191,6 +191,92 @@ class TestModelsCommand(LaunchEnv):
         self.assertEqual(self.probe.call_count, 2 * n)
 
 
+class TestNoticesOnce(Tmp):
+    """Событие о недоступной модели — одно, пока она не станет доступной (отметка model_notices)."""
+
+    def setUp(self):
+        super().setUp()
+        self.avail = {"fable": False}
+        self.probe = mock.Mock(side_effect=lambda m, *a, **k: (self.avail.get(m, True), "rc=0" if self.avail.get(m, True) else "rc=1"))
+        p = mock.patch.object(wab, "probe_model", self.probe)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_refresh_does_not_repeat_event(self):
+        wab.ensure_roles(self.cfg)
+        n = self.probe.call_count
+        wab.ensure_roles(self.cfg, refresh=True)
+        wab.ensure_roles(self.cfg, refresh=True)
+        self.assertGreater(self.probe.call_count, n)   # refresh реально перепроверяет
+        self.assertEqual(len(self.events), 1)
+
+    def test_refusal_twice_one_event_no_cache(self):
+        self.avail.update({"opus": False, "sonnet": False, "haiku": False})
+        for _ in range(2):
+            with self.assertRaises(SystemExit):
+                wab.ensure_roles(self.cfg)
+        st = wab.load_state(self.cfg)
+        self.assertNotIn("models", st)
+        self.assertEqual(len([e for e in self.events if "fable" in e]), 1)
+
+    def test_recovered_then_unavailable_again_new_event(self):
+        wab.ensure_roles(self.cfg)
+        self.avail["fable"] = True
+        wab.ensure_roles(self.cfg, refresh=True)
+        self.assertEqual(len(self.events), 1)
+        self.avail["fable"] = False
+        wab.ensure_roles(self.cfg, refresh=True)
+        self.assertEqual(len([e for e in self.events if "fable" in e]), 2)
+
+    def test_launch_busy_does_not_probe(self):
+        wab.save_state(self.cfg, {"waves": {"W1": {"tmux": "x"}}, "current": "W1"})
+        prompt = self.dir / "p.md"
+        prompt.write_text("задача\n", encoding="utf-8")
+        with mock.patch.object(wab, "tmux_alive", return_value=True):
+            with self.assertRaises(SystemExit) as cm:
+                wab.launch(self.cfg, "W2", str(prompt))
+        self.assertIn("сейчас идёт волна W1", str(cm.exception))
+        self.probe.assert_not_called()
+
+    def test_launch_existing_tmux_does_not_probe(self):
+        prompt = self.dir / "p.md"
+        prompt.write_text("задача\n", encoding="utf-8")
+        with mock.patch.object(wab, "tmux_alive", return_value=True):
+            with self.assertRaises(SystemExit) as cm:
+                wab.launch(self.cfg, "W1", str(prompt))
+        self.assertIn("уже существует", str(cm.exception))
+        self.probe.assert_not_called()
+
+
+_CHILD = r"""
+import sys, time, pathlib
+sys.path.insert(0, sys.argv[2])
+import wab
+cfg = wab.load_waves(sys.argv[1])
+def probe(m, *a, **k):
+    time.sleep(1.0)
+    return (m != "fable", "rc=0" if m != "fable" else "rc=1")
+wab.probe_model = probe
+wab.ensure_roles(cfg)
+"""
+
+
+class TestConcurrentNotice(unittest.TestCase):
+    def test_two_processes_one_event(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as t:
+            cfg = cfg_for(t)
+            cmd = [sys.executable, "-B", "-c", _CHILD, str(pathlib.Path(t) / "waves.json"), str(ROOT / "scripts")]
+            procs = [subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                     for _ in range(2)]
+            for p in procs:
+                _, err = p.communicate(timeout=60)
+                self.assertEqual(p.returncode, 0, err)
+            log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+            self.assertEqual(len([l for l in log.splitlines() if "fable" in l]), 1, log)
+
+
 class TestDashRoles(Tmp):
     def test_fallback_mark_in_header(self):
         st = {"waves": {}, "roles_effective": dict(self.cfg["roles"], tester="opus"),

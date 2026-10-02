@@ -494,6 +494,30 @@ def _release_reservation(cfg, wave, prev_current, prev_rec):
         save_state(cfg, st)
 
 
+def _check_launchable(cfg, st, wave, name):
+    """Можно ли запускать волну: другая текущая волна, уже идущий launcher, живая tmux-сессия.
+
+    Вызывается под run_lock. SystemExit с понятным текстом; иначе (current, прежняя запись волны).
+    """
+    cur = st.get("current")
+    if cur and cur != wave:
+        # иначе диспетчер потеряет идущую волну, а зависимые волны пойдут параллельно
+        cur_name = (st.get("waves", {}).get(cur) or {}).get("tmux") or f"{cfg['tmux_prefix']}{str(cur).lower()}"
+        msg = f"сейчас идёт волна {cur} (tmux {cur_name}); дождитесь DONE или остановите её"
+        if not tmux_alive(cur_name):
+            phase = (st.get("waves", {}).get(cur) or {}).get("phase") or "?"
+            msg += (f". Сессии {cur_name} нет (фаза {phase}): продолжите именно её — "
+                    f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
+        raise SystemExit(msg)
+    prev_rec = (st.get("waves") or {}).get(wave)
+    if cur == wave and (prev_rec or {}).get("phase") == "starting" and _pid_alive(prev_rec.get("launcher_pid")):
+        raise SystemExit(f"волна {wave} уже запускается другим wab.py (pid {prev_rec['launcher_pid']}); "
+                         f"дождитесь его завершения")
+    if tmux_alive(name):
+        raise SystemExit(f"tmux-сессия {name} уже существует")
+    return cur, prev_rec
+
+
 def launch(cfg, wave, prompt_file):
     """Запустить одну волну. False, если окно Claude не стало готовым: тогда ничего не отправляем."""
     if wave not in wave_ids(cfg):
@@ -506,6 +530,9 @@ def launch(cfg, wave, prompt_file):
     if not prompt:
         raise SystemExit(f"файл промпта {prompt_file} пустой")
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
+    # дешёвая предварительная проверка — до платных проверок моделей; окончательная — под резервом ниже
+    with run_lock(cfg):
+        _check_launchable(cfg, load_state(cfg), wave, name)
     # модели ролей — до резерва и вне блокировки: проверка долгая, а блокировку ждут 30 с
     roles, _ = ensure_roles(cfg)
     wave_obj = next(w for w in cfg["waves"] if w["id"] == wave)
@@ -513,22 +540,7 @@ def launch(cfg, wave, prompt_file):
     # пустом current оба пройдут проверку и запустят две волны, а current достанется последней
     with run_lock(cfg):
         st = load_state(cfg)
-        cur = st.get("current")
-        if cur and cur != wave:
-            # иначе диспетчер потеряет идущую волну, а зависимые волны пойдут параллельно
-            cur_name = (st.get("waves", {}).get(cur) or {}).get("tmux") or f"{cfg['tmux_prefix']}{str(cur).lower()}"
-            msg = f"сейчас идёт волна {cur} (tmux {cur_name}); дождитесь DONE или остановите её"
-            if not tmux_alive(cur_name):
-                phase = (st.get("waves", {}).get(cur) or {}).get("phase") or "?"
-                msg += (f". Сессии {cur_name} нет (фаза {phase}): продолжите именно её — "
-                        f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
-            raise SystemExit(msg)
-        prev_rec = (st.get("waves") or {}).get(wave)
-        if cur == wave and (prev_rec or {}).get("phase") == "starting" and _pid_alive(prev_rec.get("launcher_pid")):
-            raise SystemExit(f"волна {wave} уже запускается другим wab.py (pid {prev_rec['launcher_pid']}); "
-                             f"дождитесь его завершения")
-        if tmux_alive(name):
-            raise SystemExit(f"tmux-сессия {name} уже существует")
+        cur, prev_rec = _check_launchable(cfg, st, wave, name)
         # резерв до worktree и tmux: параллельный launch увидит волну, а watch — её запись
         st.setdefault("waves", {})
         st["current"] = wave
@@ -638,59 +650,99 @@ def probe_model(model, timeout=PROBE_TIMEOUT_SECONDS):
     return r.returncode == 0, f"rc={r.returncode}"
 
 
-def resolve_roles(cfg, st, probe=None):
-    """Эффективные модели ролей. Недоступная модель заменяется cfg['fallback_model'].
+def probe_roles(cfg, cache, probe=None):
+    """Проверить модели ролей (без событий и без записи state). Блокировку прогона не берёт: вызовы долгие.
 
-    Результаты проверок кэшируются в st['models'] (повторно не проверяются); на успехе пишет
-    st['roles_effective'] и st['role_fallbacks']. Если нужный fallback тоже недоступен — SystemExit,
-    st не меняется (следующий запуск проверит заново). Блокировку прогона не берёт: вызовы долгие.
+    cache — прежний st['models'] (или None); проверяются только модели без записи в нём.
+    Возвращает {models, effective, fallbacks, error}: error — текст отказа, если нужный fallback
+    тоже недоступен (тогда effective/fallbacks неполны).
     """
     probe = probe or probe_model
-    models = copy.deepcopy(st.get("models") or {})
+    models = copy.deepcopy(cache or {})
     roles = cfg["roles"]
+    fb = cfg["fallback_model"]
 
     def check(model):
         if model not in models:
             ok, detail = probe(model)
             models[model] = {"ok": bool(ok), "detail": detail, "checked": time.time()}
-            return True
-        return False
 
-    fb = cfg["fallback_model"]
     for model in dict.fromkeys(roles.values()):
-        if check(model) and not models[model]["ok"]:
-            users = ", ".join(r for r, m in roles.items() if m == model)
-            event(cfg, f"модель {model} недоступна ({models[model]['detail']}): роли {users} → fallback {fb}")
-    effective, fallbacks = {}, {}
+        check(model)
+    effective, fallbacks, error = {}, {}, None
     for role, model in roles.items():
         if models[model]["ok"]:
             effective[role] = model
             continue
         check(fb)
         if not models[fb]["ok"]:
-            raise SystemExit(f"модель {model} (роль {role}) недоступна, и fallback_model {fb} тоже "
-                             f"({models[fb]['detail']}); проверьте вход и доступ: claude -p --model {fb} ok")
+            error = (f"модель {model} (роль {role}) недоступна, и fallback_model {fb} тоже "
+                     f"({models[fb]['detail']}); проверьте вход и доступ: claude -p --model {fb} ok")
+            break
         effective[role] = fb
         fallbacks[role] = {"from": model, "to": fb}
-    st["models"] = models
-    st["roles_effective"] = effective
-    st["role_fallbacks"] = fallbacks
-    return effective
+    return {"models": models, "effective": effective, "fallbacks": fallbacks, "error": error}
+
+
+def apply_notices(cfg, st, result):
+    """Событие о недоступной модели — один раз: отметка st['model_notices'] {модель: detail}.
+
+    Отметка не зависит от кэша проверок (его сбрасывает `models --refresh`) и сохраняется при
+    отказе; снимается, когда модель снова доступна. Вызывать в одной критической секции с записью
+    state (под run_lock), иначе два процесса напишут одно событие дважды.
+    """
+    roles, fb = cfg["roles"], cfg["fallback_model"]
+    notices = st.setdefault("model_notices", {})
+    for model in dict.fromkeys(roles.values()):
+        info = result["models"].get(model)
+        if info is None:
+            continue
+        if info["ok"]:
+            notices.pop(model, None)
+        elif model not in notices:
+            notices[model] = info["detail"]
+            users = ", ".join(r for r, m in roles.items() if m == model)
+            event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users} → fallback {fb}")
+
+
+def _store_roles(st, result):
+    st["models"] = result["models"]
+    st["roles_effective"] = result["effective"]
+    st["role_fallbacks"] = result["fallbacks"]
+
+
+def resolve_roles(cfg, st, probe=None):
+    """Эффективные модели ролей в памяти (без блокировок): проверка + уведомления + запись в st.
+
+    При отказе (fallback тоже недоступен) — SystemExit; кэш проверок в st не пишется, а отметки
+    уведомлений остаются. Для прогона с общим state — ensure_roles (публикация под блокировкой).
+    """
+    r = probe_roles(cfg, st.get("models"), probe)
+    apply_notices(cfg, st, r)
+    if r["error"]:
+        raise SystemExit(r["error"])
+    _store_roles(st, r)
+    return r["effective"]
 
 
 def ensure_roles(cfg, refresh=False):
-    """Проверить модели вне блокировки прогона (вызовы долгие) и записать итог в state под ней."""
+    """Проверить модели вне блокировки (вызовы долгие), результат опубликовать под блокировкой.
+
+    Публикация: перечитать state, записать отметки уведомлений (событие — только если отметки ещё
+    нет) и итог. Отказ: кэш не сохраняется, отметки — да.
+    """
     with run_lock(cfg):
-        st = copy.deepcopy(load_state(cfg))
-    if refresh:
-        st.pop("models", None)
-    roles = resolve_roles(cfg, st)
+        cache = None if refresh else copy.deepcopy(load_state(cfg).get("models"))
+    r = probe_roles(cfg, cache)
     with run_lock(cfg):
         cur = load_state(cfg)
-        for k in ("models", "roles_effective", "role_fallbacks"):
-            cur[k] = st[k]
+        apply_notices(cfg, cur, r)
+        if r["error"]:
+            save_state(cfg, cur)
+            raise SystemExit(r["error"])
+        _store_roles(cur, r)
         save_state(cfg, cur)
-    return roles, st["role_fallbacks"]
+    return r["effective"], r["fallbacks"]
 
 
 # ---------- надзор ----------
