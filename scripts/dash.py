@@ -171,7 +171,7 @@ def current_panel(cfg, st):
     status = wab.read(wab.wave_path(cfg, wave) / "status")
     head = Text()
     head.append(f"{wave}  ", style="bold magenta")
-    head.append(f"tmux attach -t {w['tmux']}", style="bold white on grey23")
+    head.append(f"tmux attach -t ={w['tmux']}", style="bold white on grey23")
     head.append(f"   статус: {status}", style="yellow" if status.startswith("BLOCKED") else "green")
     ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))

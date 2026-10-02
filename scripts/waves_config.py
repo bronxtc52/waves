@@ -20,6 +20,7 @@ OPTIONAL_DEFAULTS = {"base_branch": "main", "fallback_model": "opus", "automerge
 WAVE_REQUIRED = ("id", "title", "goal", "done_when", "check")
 
 _NAME = re.compile(r"[A-Za-z0-9._-]+")
+_CHAIN = re.compile(r"[A-Za-z0-9_-]+")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _BRANCH_BAD = re.compile(r"[\x00-\x20\x7f ~^:?*\[\\]|\.\.|@\{|//")
 _WAVE_ID = re.compile(r"[A-Za-z0-9_-]+")
@@ -81,6 +82,14 @@ class _Checker:
         if rule:
             self.err(where, f"«{value}» не годится для имени ветки git: {rule}")
         return value
+
+    def chain(self, value, where):
+        """chain входит и в ветку git, и в имя tmux-сессии (там точка — разделитель окна)."""
+        self.string(value, where, dot_only_ok=False)
+        self.ref_component(value, where)
+        if "." in value:
+            self.err(where, f"«{value}»: точка недопустима в имени tmux-сессии")
+        return self.string(value, where, _CHAIN)
 
     def boolean(self, value, where):
         if not isinstance(value, bool):
@@ -144,8 +153,8 @@ def _check_wave(c, w, i, seen):
     where = f"waves[{i}]"
     c.obj(w, where, WAVE_REQUIRED, set(WAVE_REQUIRED) | {"depends_on"})
     wid = c.string(w["id"], f"{where}.id", _WAVE_ID)
-    if wid in seen:
-        c.err(f"{where}.id", f"дубликат id «{wid}»")
+    if wid.lower() in seen:
+        c.err(f"{where}.id", f"дубликат id «{wid}» (без учёта регистра: имя tmux-сессии одно)")
     out = {"id": wid,
            "title": c.string(w["title"], f"{where}.title"),
            "goal": c.string(w["goal"], f"{where}.goal"),
@@ -176,7 +185,7 @@ def load_waves(path):
     c.obj(data, "", REQUIRED, allowed)
 
     cfg = {
-        "chain": c.ref_component(c.string(data["chain"], "chain", _NAME, dot_only_ok=False), "chain"),
+        "chain": c.chain(data["chain"], "chain"),
         "run_id": c.ref_component(c.string(data["run_id"], "run_id", _NAME, dot_only_ok=False),
                                   "run_id"),
         "repo": c.string(data["repo"], "repo", _REPO),
@@ -217,7 +226,7 @@ def load_waves(path):
     waves, seen = [], set()
     for i, w in enumerate(raw_waves):
         item = _check_wave(c, w, i, seen)
-        seen.add(item["id"])
+        seen.add(item["id"].lower())
         waves.append(item)
     _check_dependencies(c, waves)
     cfg["waves"] = waves

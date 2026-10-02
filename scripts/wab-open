@@ -4,7 +4,7 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 name=$(WAB_CFG="$1" python3 -c "import os, sys; sys.path.insert(0, '$here'); import wab; c = wab.load_waves(os.environ['WAB_CFG']); s = wab.load_state(c); w = s.get('current'); print(s['waves'][w]['tmux'] if w else '')")
-if [ -z "$name" ] || ! tmux has-session -t "$name" 2>/dev/null; then
+if [ -z "$name" ] || ! tmux has-session -t "=$name" 2>/dev/null; then
   echo "Нет активной волны (цепочка завершена или окно закрыто). Enter — закрыть."; read -r; exit 0
 fi
-TMUX= exec tmux attach -f ignore-size -t "$name"
+TMUX= exec tmux attach -f ignore-size -t "=$name"

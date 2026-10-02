@@ -89,12 +89,26 @@ def sh(*args, check=True, **kw):
     return subprocess.run(args, check=check, capture_output=True, text=True, **kw)
 
 
+def sess_target(name):
+    """Цель-сессия с точным совпадением: `-t имя` совпало бы по префиксу (w1 найдёт w10)."""
+    return f"={name}"
+
+
+def pane_target(name):
+    """Цель-pane активного окна сессии `name`, тоже с точным совпадением."""
+    return f"={name}:"
+
+
+def send_keys(name, *keys, check=True):
+    return sh("tmux", "send-keys", "-t", pane_target(name), *keys, check=check)
+
+
 def tmux_alive(name):
-    return sh("tmux", "has-session", "-t", name, check=False).returncode == 0
+    return sh("tmux", "has-session", "-t", sess_target(name), check=False).returncode == 0
 
 
 def pane_text(name):
-    r = sh("tmux", "capture-pane", "-p", "-t", name, check=False)
+    r = sh("tmux", "capture-pane", "-p", "-t", pane_target(name), check=False)
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -103,15 +117,15 @@ def send_text(name, text):
     диспетчера и сессии: буферы tmux общие на весь сервер."""
     buf = f"wab-{os.getpid()}-{name}"
     sh("tmux", "load-buffer", "-b", buf, "-", input=text)
-    sh("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", name)
+    sh("tmux", "paste-buffer", "-p", "-d", "-b", buf, "-t", pane_target(name))
     time.sleep(1.5)
-    sh("tmux", "send-keys", "-t", name, "Enter")
+    send_keys(name, "Enter")
 
 
 def send_command(name, cmd):
-    sh("tmux", "send-keys", "-t", name, "-l", cmd)
+    send_keys(name, "-l", cmd)
     time.sleep(0.7)
-    sh("tmux", "send-keys", "-t", name, "Enter")
+    send_keys(name, "Enter")
 
 
 def wait_ready(name, timeout=90):
@@ -121,9 +135,9 @@ def wait_ready(name, timeout=90):
         txt = pane_text(name)
         if any(m in txt for m in TRUST_MARKERS):
             # по умолчанию выбрано «No, exit»: сначала сдвигаемся на «Yes, I trust this folder»
-            sh("tmux", "send-keys", "-t", name, "Down")
+            send_keys(name, "Down")
             time.sleep(0.5)
-            sh("tmux", "send-keys", "-t", name, "Enter")
+            send_keys(name, "Enter")
             time.sleep(3)
             continue
         if any(m in txt for m in READY_MARKERS):
@@ -296,7 +310,7 @@ def launch(cfg, wave, prompt_file):
         (wdir / "status").write_text("BLOCKED: окно Claude не стало готовым, задача не отправлена\n", encoding="utf-8")
         w["phase"] = "not_ready"
         save_state(cfg, st)
-        event(cfg, f"{wave}: окно Claude не готово в {name}, промпт НЕ отправлен; посмотреть: tmux attach -t {name}")
+        event(cfg, f"{wave}: окно Claude не готово в {name}, промпт НЕ отправлен; посмотреть: tmux attach -t ={name}")
         return False
     prompt = pathlib.Path(prompt_file).read_text(encoding="utf-8").strip()
     head = (f"[wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
@@ -327,7 +341,7 @@ def tick(cfg, st):
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status")
     now = time.time()
-    attach = f"tmux attach -t {name}  (выйти: Ctrl-b d)"
+    attach = f"tmux attach -t ={name}  (выйти: Ctrl-b d)"
 
     # сначала DONE: волна могла закончиться и закрыть окно между двумя тиками
     if status == "DONE":
@@ -335,8 +349,8 @@ def tick(cfg, st):
         ids = wave_ids(cfg)
         idx = ids.index(wave)
         event(cfg, f"{wave}: DONE")
-        sh("tmux", "send-keys", "-t", name, "-l", "/exit", check=False)
-        sh("tmux", "send-keys", "-t", name, "Enter", check=False)
+        send_keys(name, "-l", "/exit", check=False)
+        send_keys(name, "Enter", check=False)
         w["phase"] = "done"
         w["finished"] = now
         if idx + 1 >= len(ids):

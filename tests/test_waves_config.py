@@ -336,7 +336,8 @@ if __name__ == "__main__":
 
 
 REF_BAD = (".hid", "a.lock", "A.LOCK", "a.", "a..b", ".", "..", "a/b", "", "-x", "-", "--force")
-REF_GOOD = ("2026-10-02", "wave-autobot", "a.b", "run_1", "x-", "1.2.3")
+REF_GOOD = ("2026-10-02", "wave-autobot", "a.b", "run_1", "x-", "1.2.3")  # для run_id
+CHAIN_GOOD = ("wave-autobot", "run_1", "x-", "demo", "A_b-9")  # для chain: без точки
 
 
 class TestRefComponent(LoaderBase):
@@ -364,7 +365,7 @@ class TestRefComponent(LoaderBase):
         for value in REF_GOOD:
             with self.subTest(value=value):
                 d = good()
-                d["chain"] = value
+                d["chain"] = value.replace(".", "-")
                 d["run_id"] = value
                 cfg = self.load(d)
                 branch = f"wab/{cfg['chain']}/{cfg['run_id']}/W1"
@@ -387,3 +388,53 @@ class TestRefComponent(LoaderBase):
                 if value.lower().endswith(".lock") and not value.endswith(".lock"):
                     continue  # git регистрозависим; отвергаем с запасом
                 self.assertNotEqual(r.returncode, 0, branch)
+
+
+class TestTmuxName(LoaderBase):
+    """Имя tmux-сессии wab-<chain>-<wave в нижнем регистре> — всегда допустимо и однозначно."""
+
+    def test_chain_dot_rejected(self):
+        for bad in ("a.b", "1.2", "demo.x"):
+            with self.subTest(value=bad):
+                d = good()
+                d["chain"] = bad
+                self.fails(d, f"chain: ", "точка недопустима в имени tmux-сессии")
+
+    def test_chain_other_bad_chars(self):
+        for bad in ("a:b", "a b", "a/b", "ё"):
+            with self.subTest(value=bad):
+                d = good()
+                d["chain"] = bad
+                self.fails(d, "chain")
+
+    def test_chain_ref_rules_kept(self):
+        for bad in ("-x", "--force"):
+            d = good()
+            d["chain"] = bad
+            self.fails(d, "chain: ", "«-»")
+
+    def test_run_id_dot_still_ok(self):
+        d = good()
+        d["run_id"] = "a.b"
+        self.assertEqual(self.load(d)["run_id"], "a.b")
+
+    def test_wave_ids_case_duplicates_rejected(self):
+        d = good()
+        d["waves"][1]["id"] = "w1"
+        d["waves"][1]["depends_on"] = []
+        self.fails(d, "waves[1].id", "дубликат id", "w1")
+
+    def test_session_names_invariant(self):
+        ids = ["W1", "W10", "w2_x", "A-b", "Z9"]
+        for chain in CHAIN_GOOD:
+            with self.subTest(chain=chain):
+                d = good()
+                d["chain"] = chain
+                d["waves"] = [{"id": i, "title": "t", "goal": "g", "done_when": ["x"], "check": "c"}
+                              for i in ids]
+                cfg = self.load(d)
+                names = [cfg["tmux_prefix"] + w["id"].lower() for w in cfg["waves"]]
+                for n in names:
+                    self.assertNotIn(".", n)
+                    self.assertNotIn(":", n)
+                self.assertEqual(len({n.lower() for n in names}), len(names))
