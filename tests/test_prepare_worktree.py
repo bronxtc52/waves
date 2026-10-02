@@ -1,6 +1,7 @@
 """prepare_worktree на временных git-репозиториях (локальный bare как origin). tmux не нужен."""
 import os
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -392,6 +393,114 @@ class TestBaseRefspec(unittest.TestCase):
         self.assertFalse((self.cfg["run_dir"] / "worktrees" / "W1").exists())
         branches = git("branch", "--list", "wab/*", cwd=self.checkout)
         self.assertEqual(branches, "")
+
+
+class TestWaveDirNotDirectory(unittest.TestCase):
+    """На месте каталога волны символическая ссылка или файл: отказ до любых git-операций,
+    цель ссылки, файл и запись волны в git не тронуты, в сообщении — путь волны без разыменования."""
+    setUp = TestPrepareWorktree.setUp
+    _restore_env = TestPrepareWorktree._restore_env
+
+    def _wt(self):
+        return self.cfg["run_dir"] / "worktrees" / "W1"
+
+    def _listed(self):
+        out = git("worktree", "list", "--porcelain", cwd=self.checkout)
+        return {pathlib.Path(l[len("worktree "):]) for l in out.split("\n")
+                if l.startswith("worktree ")}
+
+    def _refused(self, needle):
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn(str(self._wt()), msg)
+        self.assertIn(needle, msg)
+        self.assertIn("ничего не тронуто", msg)
+        return msg
+
+    def test_symlink_to_registered_empty_outside_dir_refused(self):
+        """Волна заведена через симлинк (запись — на цели вне run_dir), цель пересоздана пустой:
+        раньше rmdir удалял цель вне run_dir и пересоздавал worktree там."""
+        outside = self.root / "outside" / "W1"
+        outside.mkdir(parents=True)
+        self._wt().parent.mkdir(parents=True)
+        self._wt().symlink_to(outside)
+        git("worktree", "add", "-b", "wab/demo/2026-10-02/W1", str(outside), "main", cwd=self.checkout)
+        shutil.rmtree(outside)
+        outside.mkdir()
+        before = self._listed()
+        self.assertIn(outside, before)
+        msg = self._refused("символическая ссылка")
+        self.assertNotIn(str(outside), msg)
+        self.assertTrue(outside.is_dir())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(self._wt().is_symlink())
+        self.assertEqual(self._listed(), before)
+
+    def test_symlink_replacing_registered_wave_refused(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        shutil.rmtree(path)
+        outside = self.root / "outside"
+        outside.mkdir()
+        self._wt().symlink_to(outside)
+        before = self._listed()
+        self.assertIn(self._wt(), before)
+        self._refused("символическая ссылка")
+        self.assertTrue(outside.is_dir())
+        self.assertTrue(self._wt().is_symlink())
+        self.assertEqual(self._listed(), before)
+
+    def test_symlink_without_record_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        self._wt().parent.mkdir(parents=True)
+        self._wt().symlink_to(outside)
+        before = self._listed()
+        self._refused("символическая ссылка")
+        self.assertTrue(outside.is_dir())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(self._listed(), before)
+
+    def test_broken_symlink_refused(self):
+        target = self.root / "nowhere" / "W1"
+        self._wt().parent.mkdir(parents=True)
+        self._wt().symlink_to(target)
+        self._refused("символическая ссылка")
+        self.assertFalse(target.exists())
+        self.assertFalse(target.parent.exists())
+        self.assertTrue(self._wt().is_symlink())
+
+    def test_file_without_record_refused(self):
+        self._wt().parent.mkdir(parents=True)
+        self._wt().write_text("data\n")
+        self._refused("файл")
+        self.assertEqual(self._wt().read_text(), "data\n")
+
+    def test_file_replacing_registered_wave_refused(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        shutil.rmtree(path)
+        self._wt().write_text("data\n")
+        before = self._listed()
+        self._refused("файл")
+        self.assertEqual(self._wt().read_text(), "data\n")
+        self.assertEqual(self._listed(), before)
+
+    def test_run_dir_behind_symlink(self):
+        """Сам run_dir лежит за симлинком: создание, повторный вызов и восстановление — как раньше."""
+        real = self.root / "real-runs"
+        real.mkdir()
+        (self.root / "link-runs").symlink_to(real)
+        self.cfg["run_dir"] = self.root / "link-runs" / "r1"
+        path = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(pathlib.Path(path), real / "r1" / "worktrees" / "W1")
+        sha = self._commit_in(path, "mine.txt")
+        self.assertEqual(wab.prepare_worktree(self.cfg, "W1"), path)
+        shutil.rmtree(path)
+        pathlib.Path(path).mkdir()
+        self.assertEqual(wab.prepare_worktree(self.cfg, "W1"), path)
+        self.assertEqual(git("-C", path, "rev-parse", "HEAD"), sha)
+
+    _commit_in = TestPrepareWorktree._commit_in
 
 
 def _c_quote(path):

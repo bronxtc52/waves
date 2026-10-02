@@ -313,7 +313,8 @@ def prepare_worktree(cfg, wave):
     Ветка, занятая другим worktree, — SystemExit. Устаревшая запись снимается точечно
     (`git worktree remove --force` только для этой волны, без общего prune): записи чужих
     отсутствующих worktree, например на отключённом диске, остаются. Заблокированная запись
-    волны (`git worktree lock`) — SystemExit, ничего не удаляется.
+    волны (`git worktree lock`) — SystemExit, ничего не удаляется. Символическая ссылка (в том
+    числе битая) или файл на месте каталога волны — SystemExit до любых git-операций.
     """
     checkout = pathlib.Path(cfg["checkout"])
     r = _git(checkout, "rev-parse", "--show-toplevel")
@@ -324,7 +325,14 @@ def prepare_worktree(cfg, wave):
         raise SystemExit(f"checkout {checkout}: это не корень git-checkout (корень — {top}); "
                          f"укажите в waves.json корень")
 
-    wt = (cfg["run_dir"] / "worktrees" / wave).resolve()
+    # родителя разыменовываем, сам каталог волны — нет: симлинк на его месте не должен увести
+    # rmdir и `worktree add` за пределы run_dir; для обычного каталога путь совпадает с resolve
+    wt = (cfg["run_dir"] / "worktrees").resolve() / wave
+    if wt.is_symlink():  # в том числе битая ссылка
+        raise SystemExit(f"{wt} — символическая ссылка, а не каталог волны; уберите её вручную, "
+                         f"ничего не тронуто")
+    if wt.exists() and not wt.is_dir():
+        raise SystemExit(f"{wt} — файл, а не каталог волны; уберите его вручную, ничего не тронуто")
     branch = f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
 
     def listing_raw():
