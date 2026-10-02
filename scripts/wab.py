@@ -39,6 +39,7 @@ PERMISSION_MARKERS = ("Do you want to proceed", "Do you want to make this edit",
 READY_MARKERS = ("? for shortcuts", "shift+tab to cycle", "for agents")
 TRUST_MARKERS = ("Yes, I trust this folder", "Do you trust the files")
 HANDOFF_TIMEOUT_MINUTES = 25   # сколько ждём handoff после запроса контрольной точки
+RELOADABLE = ("ctx_limit", "idle_minutes", "tick_seconds")  # что watch перечитывает на ходу
 CLEAR_SETTLE_SECONDS = 6       # пауза прототипа, проверена вживую; детерминированный сигнал окончания /clear — волна W3
 RUN_LOCK_TIMEOUT_SECONDS = 30  # дольше блокировку прогона не ждём: зависший wab.py не вешает launch навсегда
 
@@ -701,12 +702,21 @@ def tick(cfg, st, waves_json=None):
 
 def watch(cfg, path):
     event(cfg, f"watch запущен, ctx_limit={cfg['ctx_limit']}")
-    last = 0.0
+    last, warned = 0.0, None
     while True:
+        # На ходу меняются только пороги. Остальные поля задают прогон (run_id, chain, волны):
+        # их смена увела бы watch в чужой runs/<id>, и идущая волна осталась бы без надзора.
         try:
-            cfg = load_waves(path)  # пороги можно подкручивать на ходу
+            fresh = load_waves(path)
         except ConfigError as e:
             event(cfg, f"конфиг не перечитан, остаются прежние значения: {e}")
+        else:
+            fixed = sorted(k for k in fresh if k not in RELOADABLE and fresh[k] != cfg.get(k))
+            if fixed and fixed != warned:
+                event(cfg, f"в waves.json изменены поля {', '.join(fixed)} — они применяются только "
+                           f"перезапуском watch; на ходу применены пороги {', '.join(RELOADABLE)}")
+            warned = fixed
+            cfg = {**cfg, **{k: fresh[k] for k in RELOADABLE}}
         # тик целиком под блокировкой прогона: его записи state не перетирают резерв launch.
         # Внутри tick run_lock не вызывать — flock не реентерабелен.
         with run_lock(cfg):
