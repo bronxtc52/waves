@@ -1,7 +1,9 @@
 """tick() при DONE и вычистка секретов в event(): без tmux, всё внешнее подменено."""
 import contextlib
 import io
+import os
 import pathlib
+import shlex
 import tempfile
 import unittest
 from unittest import mock
@@ -97,18 +99,36 @@ class TestDone(_Base):
         self.assert_stopped(st, "W1")
         self.assertIn("W1 готова, но нет next-prompt.md — следующую волну не запускаю", self.log())
 
-    def test_launch_command_survives_redact_on_long_paths(self):
-        # длинный путь без дефисов и точек похож на «непрозрачную строку» вычистки
-        deep = self.dir / "projectsdirectory" / "verylongprojectname" / "configurationfiles"
+    def launch_argv(self):
+        """Команда launch из события DONE, разобранная как её разберёт shell."""
+        line = next(l for l in self.log().splitlines() if "Следующая волна:" in l)
+        return shlex.split(line.split("Следующая волна:", 1)[1])
+
+    def check_launch_command(self, where):
+        # пробел, апостроф, кириллица и длинный сегмент без дефисов (похож на «непрозрачную строку»)
+        deep = self.dir / where / ("verylongprojectname" * 3)
         deep.mkdir(parents=True)
         self.cfg_path = write_json(deep, good())
         self.cfg = wab.load_waves(str(self.cfg_path))
         wdir = self.finish("W1")
         st = self.state("W1")
         self.assertFalse(self.run_tick(st, waves_json=str(self.cfg_path)))
-        self.assertIn(f"wab.py launch {self.cfg_path} W2 {wdir / 'next-prompt.md'}", self.log())
+        self.assertEqual(self.launch_argv(),
+                         ["wab.py", "launch", str(self.cfg_path), "W2", str(wdir / "next-prompt.md")])
 
-    def test_watch_passes_waves_json(self):
+    def test_launch_command_path_with_space(self):
+        self.check_launch_command("a b c")
+
+    def test_launch_command_path_with_apostrophe(self):
+        self.check_launch_command("q'uo te")
+
+    def test_launch_command_path_cyrillic(self):
+        self.check_launch_command("тест папка")
+
+    def test_launch_command_path_with_dollar_backtick(self):
+        self.check_launch_command("x$HOME `y`")
+
+    def test_watch_passes_absolute_waves_json(self):
         seen = {}
 
         def fake_tick(cfg, st, waves_json=None):
@@ -118,7 +138,27 @@ class TestDone(_Base):
         with mock.patch.object(wab, "tick", side_effect=fake_tick), \
                 contextlib.redirect_stdout(io.StringIO()):
             wab.watch(self.cfg, str(self.cfg_path))
-        self.assertEqual(seen["waves_json"], str(self.cfg_path))
+        self.assertEqual(seen["waves_json"], str(self.cfg_path.resolve()))
+
+    def test_watch_relative_waves_json_absolute_in_event(self):
+        # относительный путь с длинным сегментом без дефисов: раньше становился «[скрыто].json»
+        seg = "L" * 60
+        (self.dir / seg).mkdir()
+        rel_target = write_json(self.dir / seg, good())
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, cwd)
+        rel = f"{seg}/waves.json"
+        self.cfg = wab.load_waves(rel)
+        wdir = self.finish("W1")
+        st = self.state("W1")
+        wab.save_state(self.cfg, st)
+        with mock.patch.object(wab, "load_state", return_value=st), \
+                contextlib.redirect_stdout(io.StringIO()):
+            wab.watch(self.cfg, rel)
+        self.assertNotIn("[скрыто].json", self.log())
+        self.assertEqual(self.launch_argv(),
+                         ["wab.py", "launch", str(rel_target.resolve()), "W2", str(wdir / "next-prompt.md")])
 
 
 class TestEventRedact(_Base):
@@ -149,21 +189,43 @@ class TestEventRedact(_Base):
             self.assertNotIn(MAIL, where)
             self.assertIn("[скрыто]", where)
 
-    def test_secret_after_known_path_still_scrubbed(self):
-        out = self.emit(f"W1: BLOCKED: {self.cfg['run_dir']}/{'Q' * 30}{TOKEN[4:]}")
-        for where in (out, self.log()):
-            self.assertNotIn(TOKEN[4:], where)
-            self.assertIn("[скрыто]", where)
+    def test_secrets_glued_to_paths_scrubbed(self):
+        rd = str(self.cfg["run_dir"])
+        jwt = "eyJ" + "hbGciOiJIUzI1NiJ9" + ".eyJzdWIiOiIxMjM0NTY3ODkwIn0" + ".SflKxwRJSMeKKF2QT4fwpM"
+        cases = {
+            "sk": (f"{rd}/{rd}sk-abcdefghijklmnop1234567890", "abcdefghijklmnop1234567890"),
+            "ghp": (f"{rd}/{rd}{TOKEN}", TOKEN[4:]),
+            "jwt": (f"{rd}/{rd}{jwt}", "SflKxwRJSMeKKF2QT4fwpM"),
+            "password": (f"{rd}/{rd}password=Hunter2Secret", "Hunter2Secret"),
+            "token": (f"{rd}/{rd}token=Hunter3Secret", "Hunter3Secret"),
+            "abc": ("abcsk-abcdefghijklmnop1234567890", "abcdefghijklmnop1234567890"),
+        }
+        for name, (text, secret) in cases.items():
+            with self.subTest(name):
+                out = self.emit(f"W1: BLOCKED: {text}")
+                for where in (out, self.log()):
+                    self.assertNotIn(secret, where)
 
-    def test_known_path_inside_secret_not_protected(self):
-        root = str(self.cfg["run_dir"].parent.parent)
-        secret = "Zx9" * 8 + root.replace("-", "").replace(".", "") + "Kq7" * 8
-        if secret.count(root) == 0:
-            self.skipTest("во временном пути есть дефис или точка")
-        out = self.emit(f"W1: BLOCKED: {secret}")
+    def test_nul_removed(self):
+        out = self.emit("W1: BLOCKED: a\x00b \x000\x00 ghp_AAAA\x00" + "B" * 30)
         for where in (out, self.log()):
-            self.assertNotIn("Zx9Zx9", where)
-            self.assertNotIn("Kq7Kq7", where)
+            self.assertNotIn("\x00", where)
+            self.assertNotIn("B" * 30, where)
+
+    def test_trusted_appended_without_redact(self):
+        cmd = "/" + "verylongprojectname" * 4 + "/waves.json"
+        out = self.emit_trusted(f"W1: {TOKEN}", f" команда: {cmd}\x00\nвторая")
+        for where in (out, self.log()):
+            self.assertNotIn(TOKEN, where)
+            self.assertIn(cmd, where)
+            self.assertNotIn("\x00", where)
+        self.assertEqual(len(self.log().splitlines()), 1)
+
+    def emit_trusted(self, text, trusted):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            wab.event(self.cfg, text, trusted=trusted)
+        return out.getvalue()
 
     def test_long_message_truncated(self):
         self.emit("слово " * 1000)

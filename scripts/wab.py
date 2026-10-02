@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -59,33 +60,19 @@ def save_state(cfg, st):
     tmp.replace(state_path(cfg))
 
 
-def event(cfg, text):
+def event(cfg, text, trusted=""):
     """Строка в журнал событий (events.log) и на экран; дашборд читает журнал.
 
-    Текст может нести слова сессии волны (вопрос BLOCKED и т.п.), поэтому вычищается
-    здесь, в одном месте, до склейки строк, печати и записи. Известные пути диспетчера
-    (каталог прогона, каталог waves.json, checkout) вычистка не трогает, иначе длинный путь
-    без дефисов съедается как «непрозрачная строка» и команда launch в событии ломается;
-    всё, что идёт после такого пути, вычищается как обычно.
+    `text` может нести слова сессии волны (статус, вопрос BLOCKED, result.md), поэтому
+    всегда вычищается здесь, в одном месте, до склейки строк, печати и записи.
+    `trusted` — хвост, который диспетчер собрал сам из своих значений (команда launch,
+    путь рабочей копии); он дописывается без вычистки, иначе длинный путь съедается как
+    «непрозрачная строка». Агентский текст в `trusted` не передавать никогда.
     """
-    keep = {str(cfg["run_dir"]), str(cfg["run_dir"].parent.parent)}
-    if cfg.get("checkout"):
-        keep.add(str(cfg["checkout"]))
-    marks = {}
-    for i, path in enumerate(sorted((k for k in keep if len(k) > 1), key=len, reverse=True)):
-        mark = f"\x00{i}\x00"
-        # только путь, стоящий отдельным словом: внутри чужой длинной строки он не защищён,
-        # чтобы не разрезать секрет на куски короче порога вычистки
-        text, n = re.subn(r"(?<![^\s\"'=(])" + re.escape(path), mark, text)
-        if n:
-            marks[mark] = path
-    text = redact(text, limit=len(text) + 1)
-    for mark, path in marks.items():
-        text = text.replace(mark, path)
-    if len(text) > REDACT_MESSAGE_LIMIT:
-        text = text[:REDACT_MESSAGE_LIMIT].rstrip() + " …"
+    text = redact(text.replace("\x00", ""), REDACT_MESSAGE_LIMIT)
     text = " ⏎ ".join(l for l in text.splitlines() if l.strip())
-    line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
+    trusted = " ".join(trusted.replace("\x00", "").splitlines())
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}{trusted}"
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     with open(cfg["run_dir"] / "events.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -209,13 +196,16 @@ REDACT_LIMIT = 600           # цитата из текста волны (result
 REDACT_MESSAGE_LIMIT = 1200  # сообщение целиком; цитату сначала режем до REDACT_LIMIT
 _REDACT = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
-    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
-    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}"),
-    re.compile(r"\bxox[abposr]-[A-Za-z0-9-]{10,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
-    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b"),                      # токен бота
-    re.compile(r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|dsn|"
+    # Слева у префиксных шаблонов нет \b: секрет может быть приклеен к пути или слову
+    # («…/runs/2026sk-…», «abcghp_…»). У sk-/pk-/rk- без границы слова нужна цифра в теле,
+    # чтобы не скрывать обычные слова вроде «task-implementing-features».
+    re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|(?:sk|pk|rk)-(?=[A-Za-z_-]*\d)[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[abposr]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}\b"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
+    re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}\b"),                         # токен бота
+    re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|dsn|"
                r"connection[_-]?string|accountkey|sharedaccesskey)\b(\s*[:=]\s*)"
                r"(?:\"[^\"]*\"?|'[^']*'?|\S+)"),                             # значение целиком, в кавычках тоже
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
@@ -351,7 +341,7 @@ def launch(cfg, wave, prompt_file):
     send_text(name, head + prompt)
     w["phase"] = "running"
     save_state(cfg, st)
-    event(cfg, f"{wave}: запущена в tmux {name}, cwd {cwd}")
+    event(cfg, f"{wave}: запущена в tmux {name}", trusted=f", cwd {cwd}")
     return True
 
 
@@ -395,8 +385,10 @@ def tick(cfg, st, waves_json=None):
         elif not nxt.exists():
             event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
         else:
-            event(cfg, f"{wave}: готова; жду мерджа PR и координатора. Следующая волна: "
-                       f"wab.py launch {waves_json or '<waves.json>'} {ids[idx + 1]} {nxt}")
+            # команду собирает сам диспетчер из своих путей: квотируем для shell, не вычищаем
+            target = shlex.quote(waves_json) if waves_json else "<waves.json>"
+            cmd = " ".join(["wab.py", "launch", target, shlex.quote(ids[idx + 1]), shlex.quote(str(nxt))])
+            event(cfg, f"{wave}: готова; жду мерджа PR и координатора.", trusted=" Следующая волна: " + cmd)
         return False
 
     if not tmux_alive(name):
@@ -471,7 +463,7 @@ def watch(cfg, path):
         except ConfigError as e:
             event(cfg, f"конфиг не перечитан, остаются прежние значения: {e}")
         st = load_state(cfg)
-        if not tick(cfg, st, path):
+        if not tick(cfg, st, str(pathlib.Path(path).resolve())):
             event(cfg, "watch остановлен: нет текущей волны")
             return
         st = load_state(cfg)
