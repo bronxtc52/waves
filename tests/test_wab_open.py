@@ -101,6 +101,8 @@ def _gnu_script():
         return False
 
 
+@unittest.skipUnless(os.environ.get("WAB_LIVE_TMUX") == "1",
+                     "живой тест tmux опционален: задайте WAB_LIVE_TMUX=1 (нужен TTY-клиент)")
 @unittest.skipUnless(sys.platform.startswith("linux") and _tmux_version() >= (3, 2)
                      and _gnu_script() and shutil.which("sed"),
                      "нужны Linux, tmux >= 3.2 и script из util-linux")
