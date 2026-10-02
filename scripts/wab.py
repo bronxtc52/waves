@@ -528,10 +528,18 @@ def tick(cfg, st, waves_json=None):
         return True
 
     if status == "HANDOFF_READY" and w["phase"] == "checkpoint":
-        event(cfg, f"{wave}: handoff готов, /clear + /update (перезапуск №{w['restarts'] + 1})")
+        event(cfg, f"{wave}: handoff готов, /clear и продолжение (перезапуск №{w['restarts'] + 1})")
         send_command(name, "/clear")
-        time.sleep(6)
-        send_text(name, f"/update Продолжаем волну {wave} wave-autobot. Каталог волны: {wdir}. "
+        if not wait_ready(name):
+            msg = "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
+            event(cfg, f"{wave}: {msg}; {attach}")
+            w["phase"] = "not_ready"
+            w["notified"]["blocked"] = msg  # ветка BLOCKED на следующем тике не повторит событие
+            (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+            save_state(cfg, st)
+            return True
+        # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update
+        send_text(name, f"Продолжаем волну {wave} wave-autobot после /clear. Каталог волны: {wdir}. "
                         f"Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
         w["restarts"] += 1
         w["phase"] = "running"

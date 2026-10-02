@@ -286,5 +286,75 @@ class TestEventRedact(_Base):
             self.assertIn("[скрыто]", where)
 
 
+class TestHandoffResume(_Base):
+    """HANDOFF_READY: /clear, ожидание поля ввода и продолжение обычным промптом без «/»."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        rec = lambda kind: (lambda *a, **k: self.calls.append((kind,) + a))
+        self.ready = True
+        for name, kw in (("tmux_alive", {"return_value": True}),
+                         ("send_command", {"side_effect": rec("command")}),
+                         ("send_text", {"side_effect": rec("text")}),
+                         ("send_keys", {"side_effect": rec("keys")}),
+                         ("wait_ready", {"side_effect": lambda *a, **k: (self.calls.append(("ready",) + a),
+                                                                         self.ready)[1]})):
+            pt = mock.patch.object(wab, name, **kw)
+            pt.start()
+            self.addCleanup(pt.stop)
+        sleep = mock.patch.object(wab.time, "sleep")
+        sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def run_handoff(self, wave="W1"):
+        wdir = wab.wave_dir(self.cfg, wave)
+        (wdir / "status").write_text("HANDOFF_READY\n", encoding="utf-8")
+        st = {"current": wave, "waves": {wave: {"tmux": f"wab-demo-{wave}", "phase": "checkpoint",
+                                                "restarts": 2, "notified": {}, "checkpoint_at": 1.0}}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(wab.tick(self.cfg, st))
+        return st, wdir
+
+    def test_clear_wait_then_plain_prompt(self):
+        st, wdir = self.run_handoff()
+        kinds = [c[0] for c in self.calls]
+        self.assertEqual(kinds, ["command", "ready", "text"])
+        self.assertEqual(self.calls[0][1:], ("wab-demo-W1", "/clear"))
+        self.assertEqual(self.calls[1][1], "wab-demo-W1")
+        text = self.calls[2][2]
+        self.assertFalse(text.lstrip().startswith("/"), text)
+        self.assertNotIn("/update", text)
+        self.assertIn(f"{wdir}/handoff.md", text)
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RESUMING")
+        w = st["waves"]["W1"]
+        self.assertEqual((w["restarts"], w["phase"]), (3, "running"))
+        self.assertIsNone(w["checkpoint_at"])
+        saved = wab.load_state(self.cfg)["waves"]["W1"]
+        self.assertEqual((saved["restarts"], saved["phase"]), (3, "running"))
+        self.assertIn("W1: handoff готов, /clear и продолжение (перезапуск №3)", self.log())
+
+    def test_prompt_never_starts_with_slash(self):
+        for wave in self.cfg["waves"]:
+            wid = wave["id"] if isinstance(wave, dict) else wave
+            self.calls.clear()
+            self.run_handoff(wid)
+            texts = [c[2] for c in self.calls if c[0] == "text"]
+            self.assertEqual(len(texts), 1)
+            self.assertFalse(texts[0].startswith("/"), texts[0])
+
+    def test_not_ready_after_clear_blocks_without_prompt(self):
+        self.ready = False
+        st, wdir = self.run_handoff()
+        self.assertNotIn("text", [c[0] for c in self.calls])
+        status = (wdir / "status").read_text(encoding="utf-8").strip()
+        self.assertEqual(status, "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено")
+        w = st["waves"]["W1"]
+        self.assertEqual((w["restarts"], w["phase"]), (2, "not_ready"))
+        saved = wab.load_state(self.cfg)["waves"]["W1"]
+        self.assertEqual((saved["restarts"], saved["phase"]), (2, "not_ready"))
+        self.assertIn("W1:", self.log())
+
+
 if __name__ == "__main__":
     unittest.main()
