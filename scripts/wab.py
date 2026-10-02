@@ -266,10 +266,22 @@ def _parse_worktrees_z(out):
     return paths
 
 
-def _is_worktree_of(wt, branch):
-    """Каталог — настоящая рабочая копия: корень git ровно wt, HEAD на ветке волны."""
+def _common_dir(path):
+    """Абсолютный общий git-каталог (--git-common-dir) для path или None. --path-format — git >= 2.31."""
+    r = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if r.returncode != 0:
+        return None
+    return pathlib.Path(r.stdout.removesuffix("\n")).resolve()
+
+
+def _is_worktree_of(wt, branch, checkout):
+    """Каталог — настоящая рабочая копия checkout: корень git ровно wt, общий git-каталог тот же,
+    что у checkout (а не отдельный репозиторий с веткой того же имени), HEAD на ветке волны."""
     r = _git(wt, "rev-parse", "--show-toplevel")
     if r.returncode != 0 or pathlib.Path(r.stdout.removesuffix("\n")).resolve() != wt:
+        return False
+    common = _common_dir(wt)
+    if common is None or common != _common_dir(checkout):
         return False
     r = _git(wt, "symbolic-ref", "--quiet", "HEAD")
     return r.returncode == 0 and r.stdout.removesuffix("\n") == f"refs/heads/{branch}"
@@ -283,7 +295,8 @@ def prepare_worktree(cfg, wave):
     worktree переиспользуется; если каталог пропал (или worktree удалён), а ветка осталась,
     worktree восстанавливается на той же ветке со всеми её коммитами; так же — если каталог
     создан заново пустым (запись в git есть, метаданных нет). Такой же каталог с файлами —
-    SystemExit без удаления. Ветка, занятая другим worktree, — SystemExit.
+    обычная папка или отдельный репозиторий с веткой того же имени — SystemExit без удаления.
+    Ветка, занятая другим worktree, — SystemExit.
     """
     checkout = pathlib.Path(cfg["checkout"])
     r = _git(checkout, "rev-parse", "--show-toplevel")
@@ -314,12 +327,13 @@ def prepare_worktree(cfg, wave):
             raise SystemExit(f"worktree {wt} стоит не на ветке волны: ожидается {branch}, "
                              f"фактически {shown}; переключите его обратно вручную "
                              f"(git -C {wt} switch {branch}), файлы и ветки не тронуты")
-        if _is_worktree_of(wt, branch):
+        if _is_worktree_of(wt, branch, checkout):
             return str(wt)
-        # запись есть, но каталог создан заново обычной папкой: git-метаданных в нём нет
+        # запись есть, но на месте каталога обычная папка или отдельный репозиторий (в нём всегда .git)
         if any(wt.iterdir()):
-            raise SystemExit(f"{wt} зарегистрирован как worktree, но git-метаданных в нём нет; "
-                             f"уберите каталог вручную (файлы в нём не тронуты)")
+            raise SystemExit(f"{wt} зарегистрирован как worktree этого репозитория, но в каталоге нет "
+                             f"его рабочей копии (чужой репозиторий или обычная папка); "
+                             f"уберите каталог вручную, файлы не тронуты")
         wt.rmdir()  # пустой каталог ничего не хранит; дальше — восстановление на той же ветке
     if wt in registered:  # запись есть, каталога нет: чистим запись
         _git(checkout, "worktree", "prune")

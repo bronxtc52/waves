@@ -185,6 +185,41 @@ class TestPrepareWorktree(unittest.TestCase):
         listing = git("worktree", "list", "--porcelain", cwd=self.checkout)
         self.assertIn(path, listing)
 
+    def test_recreated_as_foreign_repo_same_branch_refused(self):
+        """На месте worktree — отдельный `git init` с веткой того же имени: это чужой репозиторий, отказ."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        branch = "wab/demo/2026-10-02/W1"
+        sha = self._commit_in(path, "mine.txt")
+        shutil.rmtree(path)
+        git("init", "-b", branch, path)
+        foreign = pathlib.Path(path) / "foreign.txt"
+        foreign.write_text("чужое\n", encoding="utf-8")
+        git("add", ".", cwd=path)
+        git("commit", "-m", "foreign", cwd=path)
+        foreign_sha = git("-C", path, "rev-parse", "HEAD")
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn(path, msg)
+        self.assertIn("вручную", msg)
+        self.assertIn("чужой репозиторий", msg)
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "чужое\n")
+        self.assertEqual(sorted(p.name for p in pathlib.Path(path).iterdir()), [".git", "foreign.txt"])
+        self.assertEqual(git("-C", path, "rev-parse", "HEAD"), foreign_sha)
+        self.assertEqual(git("-C", path, "rev-parse", "--show-toplevel"), path)
+        self.assertEqual(git("rev-parse", f"refs/heads/{branch}", cwd=self.checkout), sha)
+        self.assertIn(path, git("worktree", "list", "--porcelain", cwd=self.checkout))
+
+    def test_is_worktree_of_checks_common_dir(self):
+        """_is_worktree_of принимает настоящий worktree и отвергает отдельный репозиторий с той же веткой."""
+        path = wab.prepare_worktree(self.cfg, "W1")
+        branch = "wab/demo/2026-10-02/W1"
+        self.assertTrue(wab._is_worktree_of(pathlib.Path(path), branch, self.checkout))
+        other = self.root / "other"
+        git("init", "-b", branch, str(other))
+        self.assertFalse(wab._is_worktree_of(other.resolve(), branch, self.checkout))
+
     def test_recreated_dir_inside_other_repo_restored(self):
         """Пустой каталог внутри чужого git-репозитория: show-toplevel даёт не wt, а внешний корень."""
         import shutil
