@@ -290,6 +290,13 @@ def launch(cfg, wave, prompt_file):
     """Запустить одну волну. False, если окно Claude не стало готовым: тогда ничего не отправляем."""
     if wave not in wave_ids(cfg):
         raise SystemExit(f"волны «{wave}» нет в waves.json (есть: {', '.join(wave_ids(cfg))})")
+    # промпт читаем и проверяем ДО любых побочных эффектов (worktree, tmux, state)
+    try:
+        prompt = pathlib.Path(prompt_file).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SystemExit(f"файл промпта {prompt_file} не прочитан: {e}")
+    if not prompt:
+        raise SystemExit(f"файл промпта {prompt_file} пустой")
     st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     if tmux_alive(name):
@@ -312,7 +319,6 @@ def launch(cfg, wave, prompt_file):
         save_state(cfg, st)
         event(cfg, f"{wave}: окно Claude не готово в {name}, промпт НЕ отправлен; посмотреть: tmux attach -t ={name}")
         return False
-    prompt = pathlib.Path(prompt_file).read_text(encoding="utf-8").strip()
     head = (f"[wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
             f"Рабочая копия (git worktree): {cwd}. Протокол — в системной инструкции.\n\n")
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
@@ -486,7 +492,10 @@ def main(argv=None):
     if args.cmd == "validate":
         print(json.dumps(cfg, ensure_ascii=False, indent=2, default=str))
     elif args.cmd == "launch":
-        launch(cfg, args.wave, args.prompt_file)
+        if not launch(cfg, args.wave, args.prompt_file):
+            print(f"{args.wave}: окно Claude не стало готовым, задача волне не отправлена "
+                  f"(подробности в событиях и status волны)", file=sys.stderr)
+            return 3
     elif args.cmd == "watch":
         watch(cfg, args.waves_json)
     elif args.cmd == "status":

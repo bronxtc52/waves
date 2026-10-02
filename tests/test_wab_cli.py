@@ -92,6 +92,68 @@ class TestCli(unittest.TestCase):
         py_compile.compile(str(ROOT / "scripts" / "dash.py"), doraise=True,
                            cfile=str(self.dir / "dash.pyc"))
 
+class TestLaunchGuards(unittest.TestCase):
+    """launch: плохой промпт не оставляет следов; не готовое окно даёт ненулевой код."""
+
+    def setUp(self):
+        from unittest import mock
+        import wab
+        self.wab = wab
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = pathlib.Path(self._tmp.name)
+        self.cfg_path = write_json(self.dir, good())
+        self.calls = []
+        names = ["tmux_alive", "prepare_worktree", "sh", "save_state", "event", "send_text", "wait_ready"]
+        self.m = {}
+        for n in names:
+            pt = mock.patch.object(wab, n, side_effect=lambda *a, _n=n, **k: self.calls.append(_n))
+            self.m[n] = pt.start()
+            self.addCleanup(pt.stop)
+        self.m["tmux_alive"].side_effect = lambda *a, **k: False
+        self.m["prepare_worktree"].side_effect = lambda *a, **k: str(self.dir)
+        self.m["wait_ready"].side_effect = lambda *a, **k: False
+        pt = mock.patch.object(wab, "load_state", return_value={"current": None, "waves": {}})
+        pt.start()
+        self.addCleanup(pt.stop)
+        pt = mock.patch.object(wab, "wave_dir", return_value=self.dir)
+        pt.start()
+        self.addCleanup(pt.stop)
+
+    def _bad_prompt(self, path):
+        cfg = self.wab.load_waves(str(self.cfg_path))
+        with self.assertRaises(SystemExit) as cm:
+            self.wab.launch(cfg, "W1", str(path))
+        self.assertIn(str(path), str(cm.exception))
+        self.assertEqual([c for c in self.calls if c != "tmux_alive"], [])
+
+    def test_missing_prompt_creates_nothing(self):
+        self._bad_prompt(self.dir / "nope.md")
+
+    def test_directory_prompt_creates_nothing(self):
+        self._bad_prompt(self.dir)
+
+    def test_non_utf8_prompt_creates_nothing(self):
+        f = self.dir / "p.md"
+        f.write_bytes(b"\xff\xfe\x80")
+        self._bad_prompt(f)
+
+    def test_blank_prompt_creates_nothing(self):
+        f = self.dir / "p.md"
+        f.write_text("  \n\t\n", encoding="utf-8")
+        self._bad_prompt(f)
+
+    def test_cli_exit_code_when_not_ready(self):
+        import contextlib
+        import io
+        f = self.dir / "p.md"
+        f.write_text("задача\n", encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.wab.main(["launch", str(self.cfg_path), "W1", str(f)])
+        self.assertEqual(rc, 3)
+        self.assertIn("не отправлена", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

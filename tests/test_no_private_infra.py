@@ -1,6 +1,7 @@
 """В коде и README не должно быть следов приватной инфраструктуры (docs/ и этот файл исключены)."""
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,15 +18,40 @@ def _git(root, *args):
                            *args], env=ENV, capture_output=True, encoding="utf-8", errors="replace")
 
 
+_RE = re.compile(PATTERN.encode(), re.IGNORECASE)
+_SELF = "tests/test_no_private_infra.py"
+
+
 def scan(root):
-    """Вхождения запрещённых слов в отслеживаемых файлах root, кроме docs/ и этого теста."""
-    r = _git(root, "grep", "-niaE", PATTERN, "--", ".", ":(exclude)docs",
-             ":(exclude)tests/test_no_private_infra.py")
-    if r.returncode == 1:
-        return []
+    """Вхождения запрещённых слов в отслеживаемых файлах root, кроме docs/ и этого теста.
+
+    Не зависит от платформы: файлы читаются байтами, поиск — регэкспом по bytes (git grep
+    на macOS по-разному ведёт себя с NUL-байтами). Результат: `путь:номер_строки:фрагмент`.
+    """
+    r = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached"], env=ENV,
+                       capture_output=True)
     if r.returncode != 0:
-        raise RuntimeError(f"git grep: {r.stderr.strip()}")
-    return r.stdout.splitlines()
+        raise RuntimeError(f"git ls-files: {r.stderr.decode('utf-8', 'replace').strip()}")
+    hits = []
+    for raw in filter(None, r.stdout.split(b"\0")):
+        rel = os.fsdecode(raw)
+        if rel == _SELF or rel == "docs" or rel.startswith("docs/"):
+            continue
+        path = os.path.join(str(root), rel)
+        try:
+            if os.path.islink(path):
+                data = os.fsencode(os.readlink(path))  # симлинк не разыменовываем
+            elif os.path.isfile(path):
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            else:
+                continue  # отсутствует в рабочем дереве, каталог или gitlink
+        except OSError:
+            continue
+        for n, line in enumerate(data.split(b"\n"), 1):
+            if _RE.search(line):
+                hits.append(f"{rel}:{n}:{line.decode('utf-8', 'replace')}")
+    return hits
 
 
 def copy_tree(dst, src=ROOT):
@@ -97,6 +123,48 @@ class TestNoPrivateInfra(unittest.TestCase):
         (self.copy / "docs" / "note.md").write_text("telegram, keyvault\n", encoding="utf-8")
         _git(self.copy, "add", "-A")
         self.assertEqual(scan(self.copy), [])
+
+    def _add(self, name, data):
+        copy_tree(self.copy)
+        f = self.copy / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(data)
+        return f
+
+    def test_word_after_nul_found(self):
+        self._add("scripts/nul.bin", b"\x00\x00Server-Watchdog\x00")
+        _git(self.copy, "add", "-A")
+        self.assertTrue(any(h.startswith("scripts/nul.bin:1:") for h in scan(self.copy)))
+
+    def test_word_in_very_long_line_found(self):
+        self._add("scripts/long.txt", b"a" * 200_000 + b" telegram " + b"b" * 100_000 + b"\n")
+        _git(self.copy, "add", "-A")
+        self.assertTrue(any(h.startswith("scripts/long.txt:1:") for h in scan(self.copy)))
+
+    def test_word_without_trailing_newline_found(self):
+        self._add("scripts/tail.txt", b"ok\nline two keyvault")
+        _git(self.copy, "add", "-A")
+        self.assertTrue(any(h.startswith("scripts/tail.txt:2:") for h in scan(self.copy)))
+
+    def test_untracked_and_pyc_not_found(self):
+        copy_tree(self.copy)
+        (self.copy / "__pycache__").mkdir()
+        (self.copy / "__pycache__" / "m.cpython-312.pyc").write_bytes(b"\x00telegram\x00")
+        (self.copy / ".gitignore").write_text("__pycache__/\n")
+        _git(self.copy, "add", "-A")  # .pyc игнорируется и не попадает в индекс
+        (self.copy / "draft.txt").write_text("telegram\n")  # неотслеживаемый
+        self.assertEqual(scan(self.copy), [])
+
+    def test_symlink_and_missing_file(self):
+        copy_tree(self.copy)
+        (self.copy / "outside.txt").write_text("fine\n")
+        os.symlink("telegram-target", self.copy / "lnk")
+        (self.copy / "gone.txt").write_text("x\n")
+        _git(self.copy, "add", "-A")
+        (self.copy / "gone.txt").unlink()
+        hits = scan(self.copy)
+        self.assertTrue(any(h.startswith("lnk:1:") for h in hits), hits)
+        self.assertFalse(any(h.startswith("gone.txt") for h in hits), hits)
 
 
 if __name__ == "__main__":
