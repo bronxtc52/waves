@@ -332,10 +332,6 @@ class TestWaves(LoaderBase):
                               "зависимость вперёд запрещена")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 REF_BAD = (".hid", "a.lock", "A.LOCK", "a.", "a..b", ".", "..", "a/b", "", "-x", "-", "--force")
 REF_GOOD = ("2026-10-02", "wave-autobot", "a.b", "run_1", "x-", "1.2.3")  # для run_id
 CHAIN_GOOD = ("wave-autobot", "run_1", "x-", "demo", "A_b-9")  # для chain: без точки
@@ -466,3 +462,6 @@ class TestSurrogates(LoaderBase):
     def test_chain(self):
         self.check(lambda d: d.update(chain="c\ud800"), "суррогат", "chain")
 
+
+if __name__ == "__main__":
+    unittest.main()

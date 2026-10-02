@@ -70,6 +70,8 @@ _stats_cache = {}
 
 def transcript_stats(cwd):
     """Сводка по всем транскриптам рабочей копии волны (по файлу на каждый перезапуск /clear)."""
+    if not cwd:  # волна зарезервирована launch, worktree ещё не готов
+        return {"turns": 0, "tools": 0, "out": 0, "read": 0, "agents": 0}
     d = wab.transcript_dir(cwd)
     found = list(d.glob("*.jsonl")) + list(d.glob("*/subagents/*.jsonl")) if d.exists() else []
     stamped = []
@@ -104,7 +106,10 @@ def transcript_stats(cwd):
 
 
 def commits_since(cwd, started):
-    r = subprocess.run(["git", "-C", cwd, "log", "--all", "--oneline", f"--since=@{int(started)}"],
+    """Коммиты ветки worktree волны с момента старта: refs у worktree общие, поэтому только HEAD."""
+    if not cwd:  # волна зарезервирована launch, worktree ещё не готов
+        return 0
+    r = subprocess.run(["git", "-C", cwd, "log", "--oneline", f"--since=@{int(started)}", "HEAD"],
                        capture_output=True, text=True)
     return len(r.stdout.splitlines()) if r.returncode == 0 else 0
 

@@ -159,10 +159,6 @@ class TestLaunchGuards(LaunchMocks, unittest.TestCase):
         self.assertIn("не отправлена", err.getvalue())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestLaunchCurrentWave(LaunchMocks, unittest.TestCase):
     """launch: пока идёт другая волна (state.current), новая не запускается и ничего не создаётся."""
 
@@ -272,3 +268,6 @@ class TestSurrogateCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2, r.stderr)
         self.assertNotIn("Traceback", r.stderr)
 
+
+if __name__ == "__main__":
+    unittest.main()
