@@ -166,6 +166,100 @@ class TestPrepareWorktree(unittest.TestCase):
         self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
         self.assertTrue((pathlib.Path(again) / "mine.txt").exists())
 
+    def _foreign_worktree(self):
+        """Чужой worktree того же checkout на другой ветке (например, на временно отключённом диске)."""
+        other = self.root / "elsewhere" / "foreign-wt"
+        git("worktree", "add", "-b", "foreign-branch", str(other), cwd=self.checkout)
+        gitdir = pathlib.Path(git("-C", str(other), "rev-parse", "--absolute-git-dir")).resolve()
+        return other, gitdir
+
+    def _assert_foreign_kept(self, other, gitdir):
+        listing = git("worktree", "list", "--porcelain", cwd=self.checkout)
+        self.assertIn(f"worktree {other}", listing)
+        self.assertTrue(gitdir.is_dir())
+        self.assertTrue((gitdir / "HEAD").exists())
+        self.assertTrue((gitdir / "gitdir").exists())
+
+    def test_restore_keeps_other_missing_worktree(self):
+        """Восстановление волны чистит только её запись: чужой отсутствующий worktree не трогается."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        other, gitdir = self._foreign_worktree()
+        shutil.rmtree(path)
+        shutil.rmtree(other)  # имитация отключённого диска
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(again, path)
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+        self._assert_foreign_kept(other, gitdir)
+
+    def test_restore_empty_dir_keeps_other_missing_worktree(self):
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        other, gitdir = self._foreign_worktree()
+        shutil.rmtree(path)
+        shutil.rmtree(other)
+        pathlib.Path(path).mkdir()
+        again = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(git("-C", again, "rev-parse", "--show-toplevel"), path)
+        self.assertEqual(git("-C", again, "rev-parse", "HEAD"), sha)
+        self._assert_foreign_kept(other, gitdir)
+
+    def test_locked_missing_worktree_refused(self):
+        """Запись волны заблокирована (git worktree lock): понятный отказ, ничего не удаляется."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        gitdir = pathlib.Path(git("-C", path, "rev-parse", "--absolute-git-dir")).resolve()
+        git("worktree", "lock", path, cwd=self.checkout)
+        shutil.rmtree(path)
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn("заблокирован", msg)
+        self.assertIn(f"git worktree unlock {path}", msg)
+        self.assertTrue((gitdir / "locked").exists())
+        self.assertIn(f"worktree {path}", git("worktree", "list", "--porcelain", cwd=self.checkout))
+        self.assertFalse(pathlib.Path(path).exists())
+        self.assertEqual(git("rev-parse", "refs/heads/wab/demo/2026-10-02/W1", cwd=self.checkout), sha)
+
+    def test_locked_empty_dir_refused_and_kept(self):
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        git("worktree", "lock", path, cwd=self.checkout)
+        shutil.rmtree(path)
+        pathlib.Path(path).mkdir()
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        self.assertIn(f"git worktree unlock {path}", str(cm.exception))
+        self.assertTrue(pathlib.Path(path).is_dir())
+        self.assertIn(f"worktree {path}", git("worktree", "list", "--porcelain", cwd=self.checkout))
+
+    def test_remove_error_reported_without_prune(self):
+        """Ошибка `git worktree remove` — SystemExit со stderr git, общего prune нет."""
+        import shutil
+        path = wab.prepare_worktree(self.cfg, "W1")
+        shutil.rmtree(path)
+        real = wab._git
+        calls = []
+
+        def fake(cwd, *args):
+            calls.append(args)
+            if args[:2] == ("worktree", "remove"):
+                return subprocess.CompletedProcess(["git", *args], 1, "", "fatal: сбой remove\n")
+            return real(cwd, *args)
+
+        with mock.patch.object(wab, "_git", side_effect=fake):
+            with self.assertRaises(SystemExit) as cm:
+                wab.prepare_worktree(self.cfg, "W1")
+        self.assertIn("сбой remove", str(cm.exception))
+        self.assertFalse(any(a[:2] == ("worktree", "prune") for a in calls))
+
+    def test_no_worktree_prune_in_source(self):
+        src = pathlib.Path(wab.__file__).read_text(encoding="utf-8")
+        self.assertNotRegex(src, r"[\"']prune[\"']")
+
     def test_recreated_nonempty_dir_refused_and_kept(self):
         """Каталог создан заново и в нём чужие файлы: отказ, ничего не удаляется."""
         import shutil

@@ -266,6 +266,20 @@ def _parse_worktrees_z(out):
     return paths
 
 
+def _locked_worktrees_z(out):
+    """Пути (resolve) worktree с атрибутом `locked` из `git worktree list --porcelain -z`."""
+    locked = set()
+    cur = None
+    for field in out.split("\0"):
+        if field == "":
+            cur = None
+        elif field.startswith("worktree "):
+            cur = pathlib.Path(field[len("worktree "):]).resolve()
+        elif (field == "locked" or field.startswith("locked ")) and cur is not None:
+            locked.add(cur)
+    return locked
+
+
 def _common_dir(path):
     """Абсолютный общий git-каталог (--git-common-dir) для path или None. --path-format — git >= 2.31."""
     r = _git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
@@ -296,7 +310,10 @@ def prepare_worktree(cfg, wave):
     worktree восстанавливается на той же ветке со всеми её коммитами; так же — если каталог
     создан заново пустым (запись в git есть, метаданных нет). Такой же каталог с файлами —
     обычная папка или отдельный репозиторий с веткой того же имени — SystemExit без удаления.
-    Ветка, занятая другим worktree, — SystemExit.
+    Ветка, занятая другим worktree, — SystemExit. Устаревшая запись снимается точечно
+    (`git worktree remove --force` только для этой волны, без общего prune): записи чужих
+    отсутствующих worktree, например на отключённом диске, остаются. Заблокированная запись
+    волны (`git worktree lock`) — SystemExit, ничего не удаляется.
     """
     checkout = pathlib.Path(cfg["checkout"])
     r = _git(checkout, "rev-parse", "--show-toplevel")
@@ -310,15 +327,25 @@ def prepare_worktree(cfg, wave):
     wt = (cfg["run_dir"] / "worktrees" / wave).resolve()
     branch = f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
 
-    def listing():
+    def listing_raw():
         # -z: путь отдаётся как есть, без кавычек и экранирования (core.quotePath), даже с переводом строки
         r = _git(checkout, "worktree", "list", "--porcelain", "-z")
         if r.returncode != 0:
             _require_git_worktree_z()
             raise SystemExit(f"git worktree list: {r.stderr.strip()}")
-        return _parse_worktrees_z(r.stdout)
+        return r.stdout
 
-    registered = listing()
+    def listing():
+        return _parse_worktrees_z(listing_raw())
+
+    raw = listing_raw()
+    registered = _parse_worktrees_z(raw)
+
+    def refuse_if_locked():
+        if wt in _locked_worktrees_z(raw):
+            raise SystemExit(f"worktree {wt} заблокирован: git worktree unlock {wt}; "
+                             f"файлы, ветки и запись не тронуты")
+
     if wt in registered and wt.is_dir():
         actual = registered[wt]
         if actual != f"refs/heads/{branch}":
@@ -334,9 +361,15 @@ def prepare_worktree(cfg, wave):
             raise SystemExit(f"{wt} зарегистрирован как worktree этого репозитория, но в каталоге нет "
                              f"его рабочей копии (чужой репозиторий или обычная папка); "
                              f"уберите каталог вручную, файлы не тронуты")
+        refuse_if_locked()
         wt.rmdir()  # пустой каталог ничего не хранит; дальше — восстановление на той же ветке
-    if wt in registered:  # запись есть, каталога нет: чистим запись
-        _git(checkout, "worktree", "prune")
+    if wt in registered:  # запись есть, каталога нет: убираем ровно запись этой волны, чужие не трогаем
+        refuse_if_locked()
+        # каталога волны здесь гарантированно нет (пустой удалён выше, непустой — отказ),
+        # поэтому --force не может стереть пользовательские файлы: он лишь снимает запись
+        r = _git(checkout, "worktree", "remove", "--force", str(wt))
+        if r.returncode != 0:
+            raise SystemExit(f"git worktree remove {wt}: {r.stderr.strip()}")
         registered = listing()
     elif wt.exists():
         raise SystemExit(f"{wt} уже существует, но не является worktree этого репозитория")
