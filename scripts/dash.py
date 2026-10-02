@@ -118,7 +118,7 @@ def wave_state(cfg, st, wave):
     w = st["waves"].get(wave)
     if not w:
         return "pending", w
-    status = wab.read(wab.wave_path(cfg, wave) / "status")
+    status = wab.redact(wab.read(wab.wave_path(cfg, wave) / "status"))
     if status.startswith("BLOCKED"):
         return "BLOCKED", w
     if w.get("phase") == "checkpoint" and status != "HANDOFF_READY":
@@ -173,7 +173,7 @@ def current_panel(cfg, st):
         return Panel(Align.center(Text("цепочка не запущена или завершена", style="grey50")),
                      title="Текущая волна", border_style="grey42")
     w = st["waves"][wave]
-    status = wab.read(wab.wave_path(cfg, wave) / "status")
+    status = wab.redact(wab.read(wab.wave_path(cfg, wave) / "status"))
     head = Text()
     head.append(f"{wave}  ", style="bold magenta")
     head.append(f"tmux attach -t ={w['tmux']}", style="bold white on grey23")
@@ -181,7 +181,8 @@ def current_panel(cfg, st):
     ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
-    screen = Text("\n".join(l[:150] for l in lines), style="grey78")
+    # сначала вычистка, потом срез под ширину: обрывок секрета на границе не узнаётся шаблоном
+    screen = Text("\n".join(wab.redact(l)[:150] for l in lines), style="grey78")
     return Panel(Group(head, Text(), ctx, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")

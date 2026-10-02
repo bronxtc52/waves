@@ -615,7 +615,9 @@ def tick(cfg, st, waves_json=None):
 
     if status.startswith("BLOCKED"):
         if once_per(w, "blocked", status):
-            event(cfg, f"{wave}: {status[:200]}; ответить: {attach}")
+            # статус целиком: event() вычищает до ограничения длины; срез сырого текста здесь
+            # оставил бы от секрета на границе обрывок короче порога шаблона, и он ушёл бы открытым
+            event(cfg, f"{wave}: {status}; ответить: {attach}")
         save_state(cfg, st)
         return True
 
@@ -717,7 +719,7 @@ def status_cmd(cfg):
     print("current:", st.get("current"))
     for wave, w in st["waves"].items():
         print(f"{wave}: tmux={w['tmux']} phase={w['phase']} ctx={w.get('tokens', 0) // 1000}k "
-              f"restarts={w['restarts']} status={read(wave_path(cfg, wave) / 'status')}")
+              f"restarts={w['restarts']} status={redact(read(wave_path(cfg, wave) / 'status'))}")
 
 
 # ---------- командная строка ----------

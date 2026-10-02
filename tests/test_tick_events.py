@@ -286,6 +286,60 @@ class TestEventRedact(_Base):
             self.assertIn("[скрыто]", where)
 
 
+class TestBlockedLongStatus(_Base):
+    """Статус BLOCKED вычищается целиком до любого ограничения длины: срез сырого текста
+    оставил бы от секрета на границе обрывок короче порога шаблона, и он ушёл бы открытым."""
+
+    def leaks(self, where):
+        body = TOKEN[4:]
+        return [body[i:i + 9] for i in range(len(body) - 8) if body[i:i + 9] in where]
+
+    def tick_with_status(self, status):
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text(status + "\n", encoding="utf-8")
+        st = {"current": "W1", "waves": {"W1": {"tmux": "wab-demo-W1", "phase": "running",
+                                                "restarts": 0, "notified": {}}}}
+        with mock.patch.object(wab, "tmux_alive", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertTrue(wab.tick(self.cfg, st))
+        return out.getvalue()
+
+    def check(self, status):
+        out = self.tick_with_status(status)
+        log = self.log()
+        self.assertIn("BLOCKED", log)
+        for where in (out, log):
+            self.assertEqual(self.leaks(where), [])
+            self.assertIn("[скрыто]", where)
+
+    def test_token_crosses_200th_char(self):
+        for start in (181, 185, 190, 196):
+            with self.subTest(start=start):
+                self.setUp()
+                # пробелы в заполнителе: сплошной текст скрыл бы шаблон «длинная непрозрачная строка»
+                pad = start - len("BLOCKED: ")
+                head = "BLOCKED: " + "слово " * (pad // 6) + "y" * (pad % 6)
+                self.check(head + TOKEN + " дальше текст")
+
+    def test_token_crosses_message_limit(self):
+        # «W1: » + статус: токен начинается чуть левее REDACT_MESSAGE_LIMIT всего сообщения
+        for start in (wab.REDACT_MESSAGE_LIMIT - 20, wab.REDACT_MESSAGE_LIMIT - 10):
+            with self.subTest(start=start):
+                self.setUp()
+                pad = start - len("W1: ") - len("BLOCKED: ")
+                self.check("BLOCKED: " + "слово " * (pad // 6) + "y" * (pad % 6) + TOKEN)
+
+    def test_status_cmd_redacts(self):
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text(f"BLOCKED: {'слово ' * 30}{TOKEN}\n", encoding="utf-8")
+        wab.save_state(self.cfg, {"current": "W1", "waves": {"W1": {
+            "tmux": "wab-demo-W1", "phase": "running", "restarts": 0, "notified": {}}}})
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            wab.status_cmd(self.cfg)
+        self.assertEqual(self.leaks(out.getvalue()), [])
+        self.assertIn("[скрыто]", out.getvalue())
+
+
 class TestHandoffResume(_Base):
     """HANDOFF_READY: /clear, пауза прототипа, ожидание поля ввода и продолжение обычным промптом без «/»."""
 
