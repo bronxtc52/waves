@@ -252,6 +252,61 @@ class TestModelsCommand(LaunchEnv):
         self.assertEqual(self.probe.call_count, 2 * n)
 
 
+class TestCacheRace(LaunchEnv):
+    """Гонка: A прочитал положительный кэш, B получил отказ и сбросил его, A не должен вернуть старый кэш."""
+
+    KEYS = ("models", "roles_effective", "role_fallbacks")
+    UP = staticmethod(lambda m, *a, **k: (True, "rc=0"))
+    DOWN = staticmethod(lambda m, *a, **k: (False, "rc=1"))
+
+    def test_stale_positive_cache_is_not_republished(self):
+        wab.ensure_roles(self.cfg, probe=self.UP)
+        self.assertIn("models", wab.load_state(self.cfg))
+        real, state = wab.probe_roles, {"n": 0}
+
+        def interleaved(cfg, cache, probe=None):
+            state["n"] += 1
+            r = real(cfg, cache, probe)           # A: проверка по положительному кэшу
+            if state["n"] == 1:                   # между чтением и публикацией A работает «процесс B»
+                with self.assertRaises(SystemExit):
+                    wab.ensure_roles(self.cfg, refresh=True, probe=self.DOWN)
+            return r
+
+        with mock.patch.object(wab, "probe_roles", interleaved):
+            with self.assertRaises(SystemExit):
+                wab.ensure_roles(self.cfg, probe=self.DOWN)
+        st = wab.load_state(self.cfg)
+        for k in self.KEYS:
+            self.assertNotIn(k, st)
+
+    def test_no_contention_bumps_generation_without_retries(self):
+        probe = mock.Mock(side_effect=self.UP)
+        wab.ensure_roles(self.cfg, probe=probe)
+        models = set(self.cfg["roles"].values())
+        self.assertEqual(probe.call_count, len(models))
+        g1 = wab.load_state(self.cfg).get("models_gen", 0)
+        self.assertGreaterEqual(g1, 1)
+        wab.ensure_roles(self.cfg, probe=probe)
+        self.assertEqual(probe.call_count, len(models))
+        self.assertGreater(wab.load_state(self.cfg)["models_gen"], g1)
+
+    def test_retries_are_bounded(self):
+        real = wab.probe_roles
+
+        def always_raced(cfg, cache, probe=None):
+            r = real(cfg, cache, probe)
+            with wab.run_lock(cfg):
+                cur = wab.load_state(cfg)
+                cur["models_gen"] = cur.get("models_gen", 0) + 1
+                wab.save_state(cfg, cur)
+            return r
+
+        with mock.patch.object(wab, "probe_roles", always_raced):
+            with self.assertRaises(SystemExit) as cm:
+                wab.ensure_roles(self.cfg, probe=self.UP)
+        self.assertIn("конкурир", str(cm.exception))
+
+
 class TestNoticesOnce(Tmp):
     """Событие о недоступной модели — одно, пока она не станет доступной (отметка model_notices)."""
 

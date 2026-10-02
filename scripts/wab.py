@@ -739,25 +739,37 @@ def resolve_roles(cfg, st, probe=None):
     return r["effective"]
 
 
-def ensure_roles(cfg, refresh=False):
+ENSURE_ROLES_ATTEMPTS = 5
+
+
+def ensure_roles(cfg, refresh=False, probe=None):
     """Проверить модели вне блокировки (вызовы долгие), результат опубликовать под блокировкой.
 
     Публикация: перечитать state, записать отметки уведомлений (событие — только если отметки ещё
-    нет) и итог. Отказ: кэш не сохраняется, отметки — да.
+    нет) и итог. Отказ: кэш не сохраняется, отметки — да. Поколение кэша st['models_gen'] растёт
+    при каждой публикации; если оно сменилось, пока шли пробы, результат устарел (другой wab.py
+    обновил или сбросил кэш) — не публикуется, цикл повторяется по актуальному кэшу.
     """
-    with run_lock(cfg):
-        cache = None if refresh else copy.deepcopy(load_state(cfg).get("models"))
-    r = probe_roles(cfg, cache)
-    with run_lock(cfg):
-        cur = load_state(cfg)
-        apply_notices(cfg, cur, r)
-        if r["error"]:
-            _drop_roles(cur)
+    for attempt in range(ENSURE_ROLES_ATTEMPTS):
+        with run_lock(cfg):
+            st0 = load_state(cfg)
+            gen = st0.get("models_gen", 0)
+            cache = None if (refresh and attempt == 0) else copy.deepcopy(st0.get("models"))
+        r = probe_roles(cfg, cache, probe)
+        with run_lock(cfg):
+            cur = load_state(cfg)
+            if cur.get("models_gen", 0) != gen:
+                continue
+            apply_notices(cfg, cur, r)
+            cur["models_gen"] = gen + 1
+            if r["error"]:
+                _drop_roles(cur)
+                save_state(cfg, cur)
+                raise SystemExit(r["error"])
+            _store_roles(cur, r)
             save_state(cfg, cur)
-            raise SystemExit(r["error"])
-        _store_roles(cur, r)
-        save_state(cfg, cur)
-    return r["effective"], r["fallbacks"]
+        return r["effective"], r["fallbacks"]
+    raise SystemExit("проверка моделей конкурирует с другим wab.py, повторите")
 
 
 # ---------- надзор ----------
