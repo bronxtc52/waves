@@ -98,6 +98,34 @@ class TestPrepareWorktree(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(marker.exists())
 
+    def test_reuse_on_other_branch_refused(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        git("checkout", "-b", "foreign", cwd=path)
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn(path, msg)
+        self.assertIn("wab/demo/2026-10-02/W1", msg)
+        self.assertIn("foreign", msg)
+        self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), "foreign")
+
+    def test_reuse_on_detached_head_refused(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        git("checkout", "--detach", cwd=path)
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn(path, msg)
+        self.assertIn("wab/demo/2026-10-02/W1", msg)
+        self.assertIn("detached HEAD", msg)
+        self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), "HEAD")
+
+    def test_reuse_on_expected_branch_ok(self):
+        path = wab.prepare_worktree(self.cfg, "W1")
+        sha = self._commit_in(path, "mine.txt")
+        self.assertEqual(wab.prepare_worktree(self.cfg, "W1"), path)
+        self.assertEqual(git("-C", path, "rev-parse", "HEAD"), sha)
+
     def _commit_in(self, path, name):
         (pathlib.Path(path) / name).write_text("x\n")
         git("add", ".", cwd=path)

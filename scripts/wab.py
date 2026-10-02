@@ -238,6 +238,13 @@ def prepare_worktree(cfg, wave):
 
     registered = listing()
     if wt in registered and wt.is_dir():
+        actual = registered[wt]
+        if actual != f"refs/heads/{branch}":
+            shown = actual[len("refs/heads/"):] if actual and actual.startswith("refs/heads/") \
+                else (actual or "detached HEAD")
+            raise SystemExit(f"worktree {wt} стоит не на ветке волны: ожидается {branch}, "
+                             f"фактически {shown}; переключите его обратно вручную "
+                             f"(git -C {wt} switch {branch}), файлы и ветки не тронуты")
         return str(wt)
     if wt in registered:  # запись есть, каталога нет: чистим запись
         _git(checkout, "worktree", "prune")
