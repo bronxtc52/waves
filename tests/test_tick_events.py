@@ -128,6 +128,41 @@ class TestDone(_Base):
     def test_launch_command_path_with_dollar_backtick(self):
         self.check_launch_command("x$HOME `y`")
 
+    def check_no_command_on_line_break(self, where):
+        # перевод строки в пути: после склейки в одну строку команда указала бы на другой путь
+        deep = self.dir / where
+        deep.mkdir(parents=True)
+        self.cfg_path = write_json(deep, good())
+        self.cfg = wab.load_waves(str(self.cfg_path))
+        self.finish("W1")
+        st = self.state("W1")
+        self.assertFalse(self.run_tick(st, waves_json=str(self.cfg_path)))
+        self.assert_stopped(st, "W1")
+        log = self.log()
+        self.assertIn("W1: готова; жду мерджа PR и координатора.", log)
+        self.assertIn("Путь содержит перевод строки — команду не печатаю, "
+                      "запустите следующую волну W2 вручную.", log)
+        self.assertNotIn("wab.py launch", log)
+        self.assertNotIn("Следующая волна:", log)
+
+    def test_no_command_path_with_lf(self):
+        self.check_no_command_on_line_break("a\nb")
+
+    def test_no_command_path_with_cr(self):
+        self.check_no_command_on_line_break("a\rb")
+
+    def test_no_command_path_with_unicode_line_separator(self):
+        self.check_no_command_on_line_break("a b")
+
+    def test_no_command_only_waves_json_with_line_break(self):
+        # run_dir чистый, перевод строки только в переданном пути waves.json
+        self.finish("W1")
+        st = self.state("W1")
+        self.assertFalse(self.run_tick(st, waves_json="/x\n/waves.json"))
+        self.assert_stopped(st, "W1")
+        self.assertIn("запустите следующую волну W2 вручную", self.log())
+        self.assertNotIn("wab.py launch", self.log())
+
     def test_watch_passes_absolute_waves_json(self):
         seen = {}
 

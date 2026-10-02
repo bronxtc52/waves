@@ -385,6 +385,12 @@ def once_per(w, key, value):
     return True
 
 
+def _has_line_break(s):
+    """Есть ли в строке разделитель, на котором режет str.splitlines() (\\n, \\r, \\u2028 …)."""
+    lines = s.splitlines()
+    return len(lines) > 1 or (bool(lines) and lines[0] != s)
+
+
 def tick(cfg, st, waves_json=None):
     wave = st.get("current")
     if not wave:
@@ -416,9 +422,15 @@ def tick(cfg, st, waves_json=None):
             event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
         else:
             # команду собирает сам диспетчер из своих путей: квотируем для shell, не вычищаем
-            target = shlex.quote(waves_json) if waves_json else "<waves.json>"
-            cmd = " ".join(["wab.py", "launch", target, shlex.quote(ids[idx + 1]), shlex.quote(str(nxt))])
-            event(cfg, f"{wave}: готова; жду мерджа PR и координатора.", trusted=" Следующая волна: " + cmd)
+            args = [waves_json or "", ids[idx + 1], str(nxt)]
+            if any(_has_line_break(a) for a in args):
+                # event() склеивает строки trusted в одну: команда указала бы на другой путь
+                event(cfg, f"{wave}: готова; жду мерджа PR и координатора. Путь содержит перевод "
+                           f"строки — команду не печатаю, запустите следующую волну {ids[idx + 1]} вручную.")
+            else:
+                target = shlex.quote(waves_json) if waves_json else "<waves.json>"
+                cmd = " ".join(["wab.py", "launch", target, shlex.quote(ids[idx + 1]), shlex.quote(str(nxt))])
+                event(cfg, f"{wave}: готова; жду мерджа PR и координатора.", trusted=" Следующая волна: " + cmd)
         return False
 
     if not tmux_alive(name):
