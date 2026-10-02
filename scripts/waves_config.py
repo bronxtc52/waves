@@ -26,6 +26,21 @@ _WAVE_ID = re.compile(r"[A-Za-z0-9_-]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
+def _ref_rule(value):
+    """Правило, нарушенное значением как компонентом имени ветки git, либо None."""
+    if value.startswith("-"):
+        return "не может начинаться с «-» (опасно как аргумент командной строки)"
+    if value.startswith("."):
+        return "не может начинаться с точки"
+    if value.endswith("."):
+        return "не может оканчиваться на точку"
+    if value.lower().endswith(".lock"):
+        return "не может оканчиваться на .lock"
+    if ".." in value:
+        return "не может содержать «..»"
+    return None
+
+
 class ConfigError(ValueError):
     """Конфиг waves.json не прошёл проверку."""
 
@@ -59,6 +74,12 @@ class _Checker:
             self.err(where, "строка содержит NUL-символ")
         if not dot_only_ok and set(value) == {"."}:
             self.err(where, f"значение «{value}» не может состоять из одних точек")
+        return value
+
+    def ref_component(self, value, where):
+        rule = _ref_rule(value)
+        if rule:
+            self.err(where, f"«{value}» не годится для имени ветки git: {rule}")
         return value
 
     def boolean(self, value, where):
@@ -155,8 +176,9 @@ def load_waves(path):
     c.obj(data, "", REQUIRED, allowed)
 
     cfg = {
-        "chain": c.string(data["chain"], "chain", _NAME, dot_only_ok=False),
-        "run_id": c.string(data["run_id"], "run_id", _NAME, dot_only_ok=False),
+        "chain": c.ref_component(c.string(data["chain"], "chain", _NAME, dot_only_ok=False), "chain"),
+        "run_id": c.ref_component(c.string(data["run_id"], "run_id", _NAME, dot_only_ok=False),
+                                  "run_id"),
         "repo": c.string(data["repo"], "repo", _REPO),
     }
     if any(set(seg) == {"."} for seg in cfg["repo"].split("/")):

@@ -1,5 +1,6 @@
 """Загрузчик waves.json v1: по тесту на каждое правило ТЗ."""
 import pathlib
+import subprocess
 import tempfile
 import unittest
 
@@ -332,3 +333,57 @@ class TestWaves(LoaderBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+REF_BAD = (".hid", "a.lock", "A.LOCK", "a.", "a..b", ".", "..", "a/b", "", "-x", "-", "--force")
+REF_GOOD = ("2026-10-02", "wave-autobot", "a.b", "run_1", "x-", "1.2.3")
+
+
+class TestRefComponent(LoaderBase):
+    """chain и run_id входят в имя ветки wab/<chain>/<run_id>/<wave>: git должен её принять."""
+
+    def test_bad_values_rejected(self):
+        for field in ("chain", "run_id"):
+            for bad in REF_BAD:
+                with self.subTest(field=field, value=bad):
+                    d = good()
+                    d[field] = bad
+                    self.fails(d, field)
+
+    def test_message_names_field_and_rule(self):
+        for value, rule in ((".hid", "начинаться с точки"), ("a.lock", ".lock"),
+                            ("A.LOCK", ".lock"), ("a.", "оканчиваться на точку"),
+                            ("a..b", ".."), ("-x", "«-»")):
+            for field in ("chain", "run_id"):
+                with self.subTest(field=field, value=value):
+                    d = good()
+                    d[field] = value
+                    self.fails(d, f"{field}: «{value}» не годится для имени ветки git", rule)
+
+    def test_good_values_accepted_and_git_agrees(self):
+        for value in REF_GOOD:
+            with self.subTest(value=value):
+                d = good()
+                d["chain"] = value
+                d["run_id"] = value
+                cfg = self.load(d)
+                branch = f"wab/{cfg['chain']}/{cfg['run_id']}/W1"
+                r = subprocess.run(["git", "check-ref-format", "--branch", branch],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_rejected_values_are_really_bad_for_git_or_cli(self):
+        for value in REF_BAD:
+            if not value or "/" in value or set(value) == {"."}:
+                continue
+            with self.subTest(value=value):
+                branch = f"wab/{value}/r/W1"
+                r = subprocess.run(["git", "check-ref-format", "--branch", branch],
+                                   capture_output=True, text=True)
+                if value.endswith("."):
+                    continue  # внутри ссылки git «a.» допускает; запрет — с запасом (пробел, подстановки)
+                if value.startswith("-"):
+                    continue  # ветка с «-» внутри компонента git допускает; запрет — из-за argv
+                if value.lower().endswith(".lock") and not value.endswith(".lock"):
+                    continue  # git регистрозависим; отвергаем с запасом
+                self.assertNotEqual(r.returncode, 0, branch)

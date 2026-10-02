@@ -53,6 +53,16 @@ class TestCli(unittest.TestCase):
         self.assertIn("лишний ключ bogus", r.stderr)
         self.assertEqual(r.stdout.strip(), "")
 
+    def test_validate_bad_ref_component(self):
+        for field in ("chain", "run_id"):
+            for bad in (".hid", "a.lock", "A.LOCK", "a.", "a..b", "-x"):
+                with self.subTest(field=field, value=bad):
+                    d = good()
+                    d[field] = bad
+                    r = run("validate", str(write_json(self.dir, d)))
+                    self.assertEqual(r.returncode, 2, r.stdout)
+                    self.assertIn(field, r.stderr)
+
     def test_validate_missing_file(self):
         r = run("validate", str(self.dir / "nope.json"))
         self.assertEqual(r.returncode, 2)
