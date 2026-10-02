@@ -287,19 +287,20 @@ class TestEventRedact(_Base):
 
 
 class TestHandoffResume(_Base):
-    """HANDOFF_READY: /clear, ожидание поля ввода и продолжение обычным промптом без «/»."""
+    """HANDOFF_READY: /clear, пауза прототипа, ожидание поля ввода и продолжение обычным промптом без «/»."""
 
     def setUp(self):
         super().setUp()
         self.calls = []
         rec = lambda kind: (lambda *a, **k: self.calls.append((kind,) + a))
         self.ready = True
-        # экран до /clear и после: первый снимок — старый, дальше — очищенный
-        self.screens = ["старый экран\n? for shortcuts", "> \n? for shortcuts (новый экран)"]
+        self.n_pane = 0
 
         def pane(*a, **k):
+            # каждый снимок отличается: признак «экран сменился» не должен заменять паузу
+            self.n_pane += 1
             self.calls.append(("pane",) + a)
-            return self.screens[0] if len(self.screens) == 1 else self.screens.pop(0)
+            return f"экран {self.n_pane}\n? for shortcuts"
 
         for name, kw in (("tmux_alive", {"return_value": True}),
                          ("pane_text", {"side_effect": pane}),
@@ -311,7 +312,7 @@ class TestHandoffResume(_Base):
             pt = mock.patch.object(wab, name, **kw)
             pt.start()
             self.addCleanup(pt.stop)
-        sleep = mock.patch.object(wab.time, "sleep")
+        sleep = mock.patch.object(wab.time, "sleep", side_effect=rec("sleep"))
         sleep.start()
         self.addCleanup(sleep.stop)
 
@@ -324,14 +325,19 @@ class TestHandoffResume(_Base):
             self.assertTrue(wab.tick(self.cfg, st))
         return st, wdir
 
-    def test_clear_wait_then_plain_prompt(self):
+    def test_settle_constant(self):
+        self.assertEqual(getattr(wab, "CLEAR_SETTLE_SECONDS", None), 6)
+        self.assertFalse(hasattr(wab, "wait_changed"))
+
+    def test_clear_pause_wait_then_plain_prompt(self):
         st, wdir = self.run_handoff()
         calls = [c for c in self.calls if c[0] != "pane"]
         kinds = [c[0] for c in calls]
-        self.assertEqual(kinds, ["command", "ready", "text"])
+        self.assertEqual(kinds, ["command", "sleep", "ready", "text"])
         self.assertEqual(calls[0][1:], ("wab-demo-W1", "/clear"))
-        self.assertEqual(calls[1][1], "wab-demo-W1")
-        text = calls[2][2]
+        self.assertEqual(calls[1][1:], (wab.CLEAR_SETTLE_SECONDS,))
+        self.assertEqual(calls[2][1], "wab-demo-W1")
+        text = calls[3][2]
         self.assertFalse(text.lstrip().startswith("/"), text)
         self.assertNotIn("/update", text)
         self.assertIn(f"{wdir}/handoff.md", text)
@@ -343,11 +349,20 @@ class TestHandoffResume(_Base):
         self.assertEqual((saved["restarts"], saved["phase"]), (3, "running"))
         self.assertIn("W1: handoff готов, /clear и продолжение (перезапуск №3)", self.log())
 
+    def test_ready_never_checked_before_settle_pause(self):
+        # пауза обязательна: даже если экран сразу сменился, wait_ready — только после sleep(>= паузы)
+        self.run_handoff()
+        kinds = [c[0] for c in self.calls]
+        i_cmd, i_ready = kinds.index("command"), kinds.index("ready")
+        paused = sum(c[1] for c in self.calls[i_cmd:i_ready] if c[0] == "sleep")
+        self.assertGreaterEqual(paused, 6)
+        self.assertGreaterEqual(paused, getattr(wab, "CLEAR_SETTLE_SECONDS", 6))
+        self.assertLess(i_ready, kinds.index("text"))
+
     def test_prompt_never_starts_with_slash(self):
         for wave in self.cfg["waves"]:
             wid = wave["id"] if isinstance(wave, dict) else wave
             self.calls.clear()
-            self.screens = ["старый экран\n? for shortcuts", "> \n? for shortcuts (новый экран)"]
             self.run_handoff(wid)
             texts = [c[2] for c in self.calls if c[0] == "text"]
             self.assertEqual(len(texts), 1)
@@ -356,54 +371,17 @@ class TestHandoffResume(_Base):
     def test_not_ready_after_clear_blocks_without_prompt(self):
         self.ready = False
         st, wdir = self.run_handoff()
-        self.assertNotIn("text", [c[0] for c in self.calls])
+        kinds = [c[0] for c in self.calls]
+        self.assertNotIn("text", kinds)
+        self.assertIn("ready", kinds)
         status = (wdir / "status").read_text(encoding="utf-8").strip()
         self.assertEqual(status, "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено")
         w = st["waves"]["W1"]
         self.assertEqual((w["restarts"], w["phase"]), (2, "not_ready"))
         saved = wab.load_state(self.cfg)["waves"]["W1"]
         self.assertEqual((saved["restarts"], saved["phase"]), (2, "not_ready"))
-        self.assertIn("W1:", self.log())
-        self.assertNotIn("перезапуск", self.log())
-
-    def test_prompt_sent_only_after_screen_changed(self):
-        old = "старый экран\n? for shortcuts"
-        self.screens = [old, old, old, "> \n? for shortcuts (новый экран)"]
-        self.run_handoff()
-        kinds = [c[0] for c in self.calls]
-        self.assertEqual(kinds[0], "pane")  # снимок экрана снят ДО /clear
-        i_cmd, i_text = kinds.index("command"), kinds.index("text")
-        self.assertEqual(kinds[i_cmd:], ["command", "pane", "pane", "pane", "ready", "text"])
-        self.assertGreaterEqual(kinds[i_cmd:i_text].count("pane"), 2)
-        self.assertIn("W1: handoff готов, /clear и продолжение (перезапуск №3)", self.log())
-
-    def test_screen_unchanged_until_timeout_blocks(self):
-        old = "старый экран\n? for shortcuts"
-        self.screens = [old]
-        clock = iter(range(0, 10000, 5))
-        with mock.patch.object(wab.time, "time", side_effect=lambda: float(next(clock))):
-            st, wdir = self.run_handoff()
-        kinds = [c[0] for c in self.calls]
-        self.assertNotIn("text", kinds)
-        self.assertNotIn("ready", kinds)
-        self.assertGreaterEqual(kinds.count("pane"), 2)
-        status = (wdir / "status").read_text(encoding="utf-8").strip()
-        self.assertEqual(status, "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено")
-        w = st["waves"]["W1"]
-        self.assertEqual((w["restarts"], w["phase"]), (2, "not_ready"))
         self.assertIn("W1: BLOCKED", self.log())
         self.assertNotIn("перезапуск", self.log())
-
-    def test_screen_changed_but_not_ready_blocks(self):
-        self.ready = False
-        st, wdir = self.run_handoff()
-        kinds = [c[0] for c in self.calls]
-        self.assertNotIn("text", kinds)
-        self.assertIn("ready", kinds)
-        self.assertTrue((wdir / "status").read_text(encoding="utf-8").startswith("BLOCKED"))
-        self.assertEqual(st["waves"]["W1"]["restarts"], 2)
-        self.assertNotIn("перезапуск", self.log())
-
 
 if __name__ == "__main__":
     unittest.main()
