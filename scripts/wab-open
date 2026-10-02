@@ -3,7 +3,13 @@
 # Использование: wab-open <waves.json>  — отсоединиться Ctrl-b d, чтобы вернуться на дашборд.
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
-name=$(WAB_CFG="$1" python3 -c "import os, sys; sys.path.insert(0, '$here'); import wab; c = wab.load_waves(os.environ['WAB_CFG']); s = wab.load_state(c); w = s.get('current'); print(s['waves'][w]['tmux'] if w else '')")
+# каталог и конфиг уходят в Python переменными окружения, в исходник ничего не подставляется
+name=$(WAB_HERE="$here" WAB_CFG="$1" python3 -c "import os, sys; sys.path.insert(0, os.environ['WAB_HERE']); import wab; c = wab.load_waves(os.environ['WAB_CFG']); s = wab.load_state(c); w = s.get('current'); print(s['waves'][w]['tmux'] if w else '')")
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "Ошибка: не удалось определить текущую волну (python3 завершился с кодом $rc, см. сообщение выше). Enter — закрыть." >&2
+  read -r; exit "$rc"
+fi
 if [ -z "$name" ] || ! tmux has-session -t "=$name" 2>/dev/null; then
   echo "Нет активной волны (цепочка завершена или окно закрыто). Enter — закрыть."; read -r; exit 0
 fi

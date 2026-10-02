@@ -1,2 +1,11 @@
 unbind-key -q -n BTab
-bind-key -n "C-\\" if-shell -F "#{@wab_open}" { run-shell -b "tmux display-popup -c '#{client_name}' -E -w 95% -h 90% -T ' волна ' '#{@wab_open}'" } { if-shell -F "#{m:*ignore-size*,#{client_flags}}" { detach-client } { send-keys "C-\\" } }
+# C-\ открывает волну во всплывающем окне, если задан @wab_open, иначе отсоединяет / шлёт клавишу.
+# Контракт @wab_open: КОМАНДНАЯ СТРОКА, которую разбирает ровно один sh (sh -c). Путь с пробелами,
+# апострофом, $ или " пользователь заключает в кавычки сам, например:
+#   tmux set -g @wab_open '"/path/O'\''Brien/wab-open" /path/waves.json'
+# Значение не проходит через строки tmux/run-shell: попап выполняет константу, которая читает
+# @wab_open во время работы. tmux при чтении экранирует «$» как «\$»; константа это снимает (sed `\$` -> `$`).
+# Это точная инверсия: tmux превращает каждый «$» в «\$», так что литерал `\$` в значении приходит как `\\$`
+# и после sed снова равен `\$`. Проверено на tmux 3.4: show-options -gqv, display-message -p и #{q:} экранируют
+# одинаково (#{q:} ещё и удваивает «\»), способа читать без экранирования и без sed нет.
+bind-key -n "C-\\" if-shell -F "#{@wab_open}" { display-popup -E -w 95% -h 90% -T ' волна ' "exec sh -c \"\$(tmux show-options -gqv @wab_open | sed 's/[\\][\$]/\$/g')\"" } { if-shell -F "#{m:*ignore-size*,#{client_flags}}" { detach-client } { send-keys "C-\\" } }
