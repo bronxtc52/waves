@@ -1,4 +1,5 @@
 """Загрузчик waves.json v1: по тесту на каждое правило ТЗ."""
+import json
 import pathlib
 import subprocess
 import tempfile
@@ -438,3 +439,30 @@ class TestTmuxName(LoaderBase):
                     self.assertNotIn(".", n)
                     self.assertNotIn(":", n)
                 self.assertEqual(len({n.lower() for n in names}), len(names))
+
+
+class TestSurrogates(LoaderBase):
+    def _raw(self, mutate):
+        d = good()
+        mutate(d)
+        return json.dumps(d)  # ensure_ascii: суррогат остаётся экранированием \\ud800
+
+    def check(self, mutate, *fragments):
+        msg = self.fails(self._raw(mutate), *fragments)
+        msg.encode("utf-8")  # сообщение само печатаемо
+
+    def test_title(self):
+        self.check(lambda d: d["waves"][0].update(title="a\ud800b"), "суррогат", "waves[0].title")
+
+    def test_base_branch(self):
+        self.check(lambda d: d.update(base_branch="m\udfffx"), "суррогат", "base_branch")
+
+    def test_top_level_key(self):
+        self.check(lambda d: d.update({"bad\ud800": 1}), "суррогат")
+
+    def test_roles_key(self):
+        self.check(lambda d: d.update(roles={"co\ud800der": "opus"}), "суррогат", "roles")
+
+    def test_chain(self):
+        self.check(lambda d: d.update(chain="c\ud800"), "суррогат", "chain")
+

@@ -157,3 +157,34 @@ class TestLaunchGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSurrogateCli(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = pathlib.Path(self._tmp.name)
+
+    def test_validate_surrogate_rc2_no_traceback(self):
+        d = good()
+        d["waves"][0]["title"] = "a\ud800b"
+        r = run("validate", str(write_json(self.dir, json.dumps(d))))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_ascii_io_with_cyrillic_ok(self):
+        p = write_json(self.dir, good())
+        r = subprocess.run([sys.executable, str(WAB), "validate", str(p)], capture_output=True,
+                           text=True, env=dict(os.environ, PYTHONIOENCODING="ascii"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+    def test_ascii_stderr_error_message_ok(self):
+        d = good()
+        d["waves"][0]["title"] = "Каркас\ud800"
+        p = write_json(self.dir, json.dumps(d))
+        r = subprocess.run([sys.executable, str(WAB), "validate", str(p)], capture_output=True,
+                           text=True, env=dict(os.environ, PYTHONIOENCODING="ascii"))
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+

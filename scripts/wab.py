@@ -275,10 +275,11 @@ def prepare_worktree(cfg, wave):
         r = _git(checkout, "worktree", "add", str(wt), branch)
     else:
         base = cfg["base_branch"]
-        r = _git(checkout, "fetch", "origin", base)
+        # явный refspec: в single-branch клоне обычный fetch кладёт базу только в FETCH_HEAD
+        r = _git(checkout, "fetch", "origin", f"+refs/heads/{base}:refs/remotes/origin/{base}")
         if r.returncode != 0:
             raise SystemExit(f"git fetch origin {base}: {r.stderr.strip()}")
-        r = _git(checkout, "worktree", "add", "-b", branch, str(wt), f"origin/{base}")
+        r = _git(checkout, "worktree", "add", "-b", branch, str(wt), f"refs/remotes/origin/{base}")
     if r.returncode != 0:
         raise SystemExit(f"git worktree add {branch}: {r.stderr.strip()}")
     return str(wt)
@@ -483,6 +484,12 @@ def build_parser():
 
 
 def main(argv=None):
+    # вывод не должен падать на кодировке терминала (ascii, C-локаль)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     try:
         cfg = load_waves(args.waves_json)

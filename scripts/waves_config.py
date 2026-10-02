@@ -130,6 +130,26 @@ def _no_duplicates(pairs):
     return seen
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _reject_surrogates(value, where=""):
+    """Обойти разобранный JSON: строки (и ключи) с одиночными суррогатами не печатаемы и не годятся."""
+    if isinstance(value, str):
+        if _SURROGATE.search(value):
+            raise ConfigError(f"{where or '<корень>'}: строка содержит суррогатный символ "
+                              f"U+D800–U+DFFF: {ascii(value)}")
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            _reject_surrogates(item, f"{where}[{i}]")
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if _SURROGATE.search(key):
+                raise ConfigError(f"{where + '.' if where else ''}ключ {ascii(key)}: "
+                                  f"суррогатный символ U+D800–U+DFFF в имени ключа")
+            _reject_surrogates(item, f"{where}.{key}" if where else key)
+
+
 def _read(path):
     path = pathlib.Path(path)
     name = path.name
@@ -140,7 +160,9 @@ def _read(path):
     except OSError as e:
         raise ConfigError(f"{name}: не удалось прочитать файл: {e.strerror or e}") from None
     try:
-        return name, json.loads(raw, object_pairs_hook=_no_duplicates)
+        data = json.loads(raw, object_pairs_hook=_no_duplicates)
+        _reject_surrogates(data)
+        return name, data
     except ConfigError as e:
         raise ConfigError(f"{name}: {e}") from None
     except RecursionError:

@@ -175,5 +175,47 @@ class TestPrepareWorktree(unittest.TestCase):
         self.assertIn("nope", str(cm.exception))
 
 
+class TestBaseRefspec(unittest.TestCase):
+    setUp = TestPrepareWorktree.setUp
+    _restore_env = TestPrepareWorktree._restore_env
+
+    """Явный refspec для fetch: база берётся из origin даже при --single-branch клоне."""
+
+    def _develop(self):
+        git("checkout", "-b", "develop", cwd=self.checkout)
+        (self.checkout / "d.txt").write_text("d\n")
+        git("add", ".", cwd=self.checkout)
+        git("commit", "-m", "dev", cwd=self.checkout)
+        git("push", "origin", "develop", cwd=self.checkout)
+        sha = git("rev-parse", "HEAD", cwd=self.checkout)
+        git("checkout", "main", cwd=self.checkout)
+        return sha
+
+    def test_single_branch_clone_other_base(self):
+        sha = self._develop()
+        clone = self.root / "single"
+        git("clone", "--single-branch", "--branch", "main", str(self.origin), str(clone))
+        self.cfg.update(checkout=str(clone), base_branch="develop")
+        path = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(git("-C", path, "rev-parse", "HEAD"), sha)
+
+    def test_regular_clone(self):
+        clone = self.root / "regular"
+        git("clone", str(self.origin), str(clone))
+        main_sha = git("rev-parse", "HEAD", cwd=clone)
+        self.cfg.update(checkout=str(clone))
+        path = wab.prepare_worktree(self.cfg, "W1")
+        self.assertEqual(git("-C", path, "rev-parse", "HEAD"), main_sha)
+
+    def test_missing_base_branch(self):
+        self.cfg.update(base_branch="nope")
+        with self.assertRaises(SystemExit) as cm:
+            wab.prepare_worktree(self.cfg, "W1")
+        self.assertIn("nope", str(cm.exception))
+        self.assertFalse((self.cfg["run_dir"] / "worktrees" / "W1").exists())
+        branches = git("branch", "--list", "wab/*", cwd=self.checkout)
+        self.assertEqual(branches, "")
+
+
 if __name__ == "__main__":
     unittest.main()
