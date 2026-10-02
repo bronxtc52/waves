@@ -16,6 +16,8 @@ handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне реп
 Импорт модуля ничего не запускает и не создаёт файлов.
 """
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -38,6 +40,7 @@ READY_MARKERS = ("? for shortcuts", "shift+tab to cycle", "for agents")
 TRUST_MARKERS = ("Yes, I trust this folder", "Do you trust the files")
 HANDOFF_TIMEOUT_MINUTES = 25   # сколько ждём handoff после запроса контрольной точки
 CLEAR_SETTLE_SECONDS = 6       # пауза прототипа, проверена вживую; детерминированный сигнал окончания /clear — волна W3
+RUN_LOCK_TIMEOUT_SECONDS = 30  # дольше блокировку прогона не ждём: зависший wab.py не вешает launch навсегда
 
 
 # ---------- конфиг и состояние ----------
@@ -60,6 +63,40 @@ def save_state(cfg, st):
     tmp = state_path(cfg).with_suffix(".tmp")
     tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(state_path(cfg))
+
+
+@contextlib.contextmanager
+def run_lock(cfg, timeout=None):
+    """Межпроцессная блокировка прогона: flock(LOCK_EX) на run_dir/state.lock.
+
+    Сериализует «прочитать state → проверить → записать» между процессами wab.py одного
+    прогона (два координатора с launch, watch). Ожидание ограничено `timeout` секундами
+    (по умолчанию RUN_LOCK_TIMEOUT_SECONDS), дальше — SystemExit с понятным текстом.
+    Блокировка не реентерабельна: внутри неё run_lock не вызывать (flock на втором
+    дескрипторе того же процесса тоже ждёт). Симлинк вместо state.lock — отказ.
+    """
+    timeout = RUN_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+    run_dir = cfg["run_dir"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "state.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except OSError as e:
+        raise SystemExit(f"файл блокировки {path} не открыт: {e}")
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SystemExit(f"другой wab.py держит блокировку прогона {run_dir} дольше {timeout} с "
+                                     f"(файл {path}); повторите позже или проверьте, не завис ли он")
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)  # закрытие дескриптора снимает flock
 
 
 def event(cfg, text, trusted=""):
@@ -404,6 +441,45 @@ def prepare_worktree(cfg, wave):
 
 # ---------- запуск ----------
 
+def _pid_alive(pid):
+    """Жив ли процесс с этим pid на этой машине (для резерва волны другим launch)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _update_wave(cfg, wave, **fields):
+    """Под блокировкой прогона перечитать state и обновить поля записи волны (не затирая чужие записи)."""
+    with run_lock(cfg):
+        st = load_state(cfg)
+        w = st.setdefault("waves", {}).setdefault(wave, {})
+        w.update(fields)
+        if fields.get("phase") in ("running", "not_ready"):
+            w.pop("launcher_pid", None)
+        save_state(cfg, st)
+        return w
+
+
+def _release_reservation(cfg, wave, prev_current, prev_rec):
+    """Снять резерв неудачного launch: вернуть прежний current и прежнюю запись волны (или убрать её)."""
+    with run_lock(cfg):
+        st = load_state(cfg)
+        if st.get("current") != wave or (st.get("waves", {}).get(wave) or {}).get("launcher_pid") != os.getpid():
+            return  # резерв уже не наш: state поменял кто-то другой, не трогаем
+        st["current"] = prev_current
+        if prev_rec is None:
+            st["waves"].pop(wave, None)
+        else:
+            st["waves"][wave] = prev_rec
+        save_state(cfg, st)
+
+
 def launch(cfg, wave, prompt_file):
     """Запустить одну волну. False, если окно Claude не стало готовым: тогда ничего не отправляем."""
     if wave not in wave_ids(cfg):
@@ -415,44 +491,57 @@ def launch(cfg, wave, prompt_file):
         raise SystemExit(f"файл промпта {prompt_file} не прочитан: {e}")
     if not prompt:
         raise SystemExit(f"файл промпта {prompt_file} пустой")
-    st = load_state(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
-    cur = st.get("current")
-    if cur and cur != wave:
-        # иначе диспетчер потеряет идущую волну, а зависимые волны пойдут параллельно
-        cur_name = (st.get("waves", {}).get(cur) or {}).get("tmux") or f"{cfg['tmux_prefix']}{str(cur).lower()}"
-        msg = f"сейчас идёт волна {cur} (tmux {cur_name}); дождитесь DONE или остановите её"
-        if not tmux_alive(cur_name):
-            phase = (st.get("waves", {}).get(cur) or {}).get("phase") or "?"
-            msg += (f". Сессии {cur_name} нет (фаза {phase}): продолжите именно её — "
-                    f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
-        raise SystemExit(msg)
-    if tmux_alive(name):
-        raise SystemExit(f"tmux-сессия {name} уже существует")
-    wdir = wave_dir(cfg, wave)
-    cwd = prepare_worktree(cfg, wave)
-    (wdir / "status").write_text("STARTING\n", encoding="utf-8")
-    cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(PROTOCOL),
-           "--name", f"wab-{cfg['chain']}-{wave}"]
-    sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
-       "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
-    # публикуем волну до ожидания: диспетчер, упавший здесь, не должен потерять сессию
-    st["current"] = wave
-    st["waves"][wave] = w = {"tmux": name, "cwd": cwd, "started": time.time(), "restarts": 0,
-                             "phase": "starting", "notified": {}}
-    save_state(cfg, st)
+    # проверка и резерв — одним шагом под блокировкой прогона: иначе два координатора при
+    # пустом current оба пройдут проверку и запустят две волны, а current достанется последней
+    with run_lock(cfg):
+        st = load_state(cfg)
+        cur = st.get("current")
+        if cur and cur != wave:
+            # иначе диспетчер потеряет идущую волну, а зависимые волны пойдут параллельно
+            cur_name = (st.get("waves", {}).get(cur) or {}).get("tmux") or f"{cfg['tmux_prefix']}{str(cur).lower()}"
+            msg = f"сейчас идёт волна {cur} (tmux {cur_name}); дождитесь DONE или остановите её"
+            if not tmux_alive(cur_name):
+                phase = (st.get("waves", {}).get(cur) or {}).get("phase") or "?"
+                msg += (f". Сессии {cur_name} нет (фаза {phase}): продолжите именно её — "
+                        f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
+            raise SystemExit(msg)
+        prev_rec = (st.get("waves") or {}).get(wave)
+        if cur == wave and (prev_rec or {}).get("phase") == "starting" and _pid_alive(prev_rec.get("launcher_pid")):
+            raise SystemExit(f"волна {wave} уже запускается другим wab.py (pid {prev_rec['launcher_pid']}); "
+                             f"дождитесь его завершения")
+        if tmux_alive(name):
+            raise SystemExit(f"tmux-сессия {name} уже существует")
+        # резерв до worktree и tmux: параллельный launch увидит волну, а watch — её запись
+        st.setdefault("waves", {})
+        st["current"] = wave
+        st["waves"][wave] = {"tmux": name, "cwd": None, "started": time.time(), "restarts": 0,
+                             "phase": "starting", "notified": {}, "launcher_pid": os.getpid()}
+        save_state(cfg, st)
+    try:
+        wdir = wave_dir(cfg, wave)
+        cwd = prepare_worktree(cfg, wave)
+        (wdir / "status").write_text("STARTING\n", encoding="utf-8")
+        cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(PROTOCOL),
+               "--name", f"wab-{cfg['chain']}-{wave}"]
+        sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
+           "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+    except BaseException:
+        # неудачный launch не должен оставить цепочку «занятой»
+        _release_reservation(cfg, wave, cur, prev_rec)
+        raise
+    # сессия создана: публикуем cwd до ожидания — диспетчер, упавший здесь, не потеряет сессию
+    _update_wave(cfg, wave, cwd=cwd)
     if not wait_ready(name):
         (wdir / "status").write_text("BLOCKED: окно Claude не стало готовым, задача не отправлена\n", encoding="utf-8")
-        w["phase"] = "not_ready"
-        save_state(cfg, st)
+        _update_wave(cfg, wave, phase="not_ready")
         event(cfg, f"{wave}: окно Claude не готово в {name}, промпт НЕ отправлен; посмотреть: tmux attach -t ={name}")
         return False
     head = (f"[wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
             f"Рабочая копия (git worktree): {cwd}. Протокол — в системной инструкции.\n\n")
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     send_text(name, head + prompt)
-    w["phase"] = "running"
-    save_state(cfg, st)
+    _update_wave(cfg, wave, phase="running")
     event(cfg, f"{wave}: запущена в tmux {name}", trusted=f", cwd {cwd}")
     return True
 
@@ -478,6 +567,8 @@ def tick(cfg, st, waves_json=None):
     if not wave:
         return False
     w = st["waves"][wave]
+    if w.get("phase") == "starting" and _pid_alive(w.get("launcher_pid")):
+        return True  # launch ещё создаёт worktree и сессию: не считать её мёртвой, ждать
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status")
     now = time.time()
@@ -604,8 +695,12 @@ def watch(cfg, path):
             cfg = load_waves(path)  # пороги можно подкручивать на ходу
         except ConfigError as e:
             event(cfg, f"конфиг не перечитан, остаются прежние значения: {e}")
-        st = load_state(cfg)
-        if not tick(cfg, st, str(pathlib.Path(path).resolve())):
+        # тик целиком под блокировкой прогона: его записи state не перетирают резерв launch.
+        # Внутри tick run_lock не вызывать — flock не реентерабелен.
+        with run_lock(cfg):
+            st = load_state(cfg)
+            alive = tick(cfg, st, str(pathlib.Path(path).resolve()))
+        if not alive:
             event(cfg, "watch остановлен: нет текущей волны")
             return
         st = load_state(cfg)
