@@ -3,12 +3,14 @@
 
 Команды:
   wab.py launch <waves.json> <волна> <файл-промпта>   запустить одну волну в tmux
-  wab.py watch  <waves.json>                           следить за цепочкой до конца
+  wab.py watch  <waves.json>                           следить за текущей волной до DONE
   wab.py status <waves.json>                           статус одним экраном
   wab.py validate <waves.json>                         проверить конфиг и напечатать его
 
 Каждая сессия волны пишет $WAB_DIR/status (RUNNING | HANDOFF_READY | BLOCKED: … | DONE),
 handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне репозитория.
+После DONE диспетчер закрывает окно волны и останавливается: следующую волну сам не
+запускает (сначала мердж PR и решение координатора), а печатает команду launch для неё.
 Нужен tmux >= 3.2: new-session принимает команду списком аргументов (3.0+) и ключ -e (3.2+).
 Импорт модуля ничего не запускает и не создаёт файлов.
 """
@@ -58,7 +60,30 @@ def save_state(cfg, st):
 
 
 def event(cfg, text):
-    """Строка в журнал событий (events.log) и на экран; дашборд читает журнал."""
+    """Строка в журнал событий (events.log) и на экран; дашборд читает журнал.
+
+    Текст может нести слова сессии волны (вопрос BLOCKED и т.п.), поэтому вычищается
+    здесь, в одном месте, до склейки строк, печати и записи. Известные пути диспетчера
+    (каталог прогона, каталог waves.json, checkout) вычистка не трогает, иначе длинный путь
+    без дефисов съедается как «непрозрачная строка» и команда launch в событии ломается;
+    всё, что идёт после такого пути, вычищается как обычно.
+    """
+    keep = {str(cfg["run_dir"]), str(cfg["run_dir"].parent.parent)}
+    if cfg.get("checkout"):
+        keep.add(str(cfg["checkout"]))
+    marks = {}
+    for i, path in enumerate(sorted((k for k in keep if len(k) > 1), key=len, reverse=True)):
+        mark = f"\x00{i}\x00"
+        # только путь, стоящий отдельным словом: внутри чужой длинной строки он не защищён,
+        # чтобы не разрезать секрет на куски короче порога вычистки
+        text, n = re.subn(r"(?<![^\s\"'=(])" + re.escape(path), mark, text)
+        if n:
+            marks[mark] = path
+    text = redact(text, limit=len(text) + 1)
+    for mark, path in marks.items():
+        text = text.replace(mark, path)
+    if len(text) > REDACT_MESSAGE_LIMIT:
+        text = text[:REDACT_MESSAGE_LIMIT].rstrip() + " …"
     text = " ⏎ ".join(l for l in text.splitlines() if l.strip())
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}Z {text}"
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
@@ -340,7 +365,7 @@ def once_per(w, key, value):
     return True
 
 
-def tick(cfg, st):
+def tick(cfg, st, waves_json=None):
     wave = st.get("current")
     if not wave:
         return False
@@ -352,6 +377,9 @@ def tick(cfg, st):
 
     # сначала DONE: волна могла закончиться и закрыть окно между двумя тиками
     if status == "DONE":
+        # DONE — это «PR готов, CI зелёный», а не «смержено». Следующая волна строится от
+        # свежего origin/<base_branch>, поэтому без мерджа она стартовала бы без этой волны.
+        # Диспетчер сам следующую волну не запускает: цепочка стоит до мерджа и координатора.
         nxt = wdir / "next-prompt.md"
         ids = wave_ids(cfg)
         idx = ids.index(wave)
@@ -360,18 +388,16 @@ def tick(cfg, st):
         send_keys(name, "Enter", check=False)
         w["phase"] = "done"
         w["finished"] = now
-        if idx + 1 >= len(ids):
-            st["current"] = None
-            save_state(cfg, st)
-            event(cfg, "цепочка завершена")
-            return False
-        if not nxt.exists():
-            st["current"] = None
-            save_state(cfg, st)
-            event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
-            return False
+        st["current"] = None
         save_state(cfg, st)
-        return launch(cfg, ids[idx + 1], nxt)
+        if idx + 1 >= len(ids):
+            event(cfg, "цепочка завершена")
+        elif not nxt.exists():
+            event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
+        else:
+            event(cfg, f"{wave}: готова; жду мерджа PR и координатора. Следующая волна: "
+                       f"wab.py launch {waves_json or '<waves.json>'} {ids[idx + 1]} {nxt}")
+        return False
 
     if not tmux_alive(name):
         if once_per(w, "dead", "1"):
@@ -445,7 +471,7 @@ def watch(cfg, path):
         except ConfigError as e:
             event(cfg, f"конфиг не перечитан, остаются прежние значения: {e}")
         st = load_state(cfg)
-        if not tick(cfg, st):
+        if not tick(cfg, st, path):
             event(cfg, "watch остановлен: нет текущей волны")
             return
         st = load_state(cfg)
@@ -474,7 +500,7 @@ def build_parser():
     s.add_argument("waves_json")
     s.add_argument("wave", help="id волны из waves.json")
     s.add_argument("prompt_file", help="файл со стартовым промптом волны")
-    s = sub.add_parser("watch", help="следить за цепочкой до конца")
+    s = sub.add_parser("watch", help="следить за текущей волной до DONE")
     s.add_argument("waves_json")
     s = sub.add_parser("status", help="статус одним экраном")
     s.add_argument("waves_json")
