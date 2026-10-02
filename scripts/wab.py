@@ -159,6 +159,19 @@ def wait_ready(name, timeout=90):
     return False
 
 
+def wait_changed(name, before, timeout=30):
+    """Ждать, пока экран окна станет отличаться от снимка before (признак, что команда обработана).
+
+    Сразу после /clear панель ещё показывает старый экран с «? for shortcuts», и wait_ready
+    вернул бы True мгновенно. Возвращает True, как только текст сменился, False по таймауту."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if pane_text(name) != before:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 # ---------- заполненность контекста по транскрипту ----------
 
 def transcript_dir(cwd):
@@ -528,9 +541,9 @@ def tick(cfg, st, waves_json=None):
         return True
 
     if status == "HANDOFF_READY" and w["phase"] == "checkpoint":
-        event(cfg, f"{wave}: handoff готов, /clear и продолжение (перезапуск №{w['restarts'] + 1})")
+        before = pane_text(name)  # снимок до /clear: старый экран тоже показывает «? for shortcuts»
         send_command(name, "/clear")
-        if not wait_ready(name):
+        if not (wait_changed(name, before) and wait_ready(name)):
             msg = "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
             event(cfg, f"{wave}: {msg}; {attach}")
             w["phase"] = "not_ready"
@@ -541,6 +554,7 @@ def tick(cfg, st, waves_json=None):
         # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update
         send_text(name, f"Продолжаем волну {wave} wave-autobot после /clear. Каталог волны: {wdir}. "
                         f"Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
+        event(cfg, f"{wave}: handoff готов, /clear и продолжение (перезапуск №{w['restarts'] + 1})")
         w["restarts"] += 1
         w["phase"] = "running"
         w["checkpoint_at"] = None
