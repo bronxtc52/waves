@@ -216,6 +216,19 @@ class TestRefusalDropsCache(LaunchEnv):
         self.assertNotIn("→ fallback opus", ev[0])
 
 
+class TestSeparateFallbackDown(Tmp):
+    def test_event_text_when_separate_fallback_also_down(self):
+        cfg = cfg_for(self.dir, fallback="opus-fb")
+        st = {"waves": {}}
+        with self.assertRaises(SystemExit):
+            wab.resolve_roles(cfg, st, probe=lambda m, *a, **k: (False, "rc=1"))
+        ev = [e for e in self.events if e.startswith("модель opus ")]
+        self.assertEqual(len(ev), 1)
+        self.assertNotIn("→ fallback", ev[0])
+        self.assertIn("запуск невозможен", ev[0])
+        self.assertIn("opus-fb тоже недоступна", ev[0])
+
+
 class TestModelsCommand(LaunchEnv):
     def run_models(self, *extra):
         out = io.StringIO()

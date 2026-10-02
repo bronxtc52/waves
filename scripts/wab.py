@@ -705,6 +705,9 @@ def apply_notices(cfg, st, result):
             if model == fb:
                 event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users}, "
                            f"fallback_model совпадает — запуск невозможен")
+            elif not result["models"].get(fb, {"ok": True})["ok"]:
+                event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users}, "
+                           f"fallback_model {fb} тоже недоступна — запуск невозможен")
             else:
                 event(cfg, f"модель {model} недоступна ({info['detail']}): роли {users} → fallback {fb}")
 
