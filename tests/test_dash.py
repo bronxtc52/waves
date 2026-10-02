@@ -29,7 +29,7 @@ def import_dash():
     for name, attrs in RICH_NAMES.items():
         m = types.ModuleType(name)
         for a in attrs:
-            setattr(m, a, type(a, (), {}))
+            setattr(m, a, type(a, (), {"__init__": lambda self, *a, **k: None}))
         sys.modules[name] = m
     sys.modules["rich"].box = sys.modules["rich.box"]
     return importlib.import_module("dash")

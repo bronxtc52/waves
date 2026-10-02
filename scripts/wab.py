@@ -748,13 +748,13 @@ def ensure_roles(cfg, refresh=False, probe=None):
     Публикация: перечитать state, записать отметки уведомлений (событие — только если отметки ещё
     нет) и итог. Отказ: кэш не сохраняется, отметки — да. Поколение кэша st['models_gen'] растёт
     при каждой публикации; если оно сменилось, пока шли пробы, результат устарел (другой wab.py
-    обновил или сбросил кэш) — не публикуется, цикл повторяется по актуальному кэшу.
+    обновил или сбросил кэш) — не публикуется, цикл повторяется (refresh — снова со свежими пробами, обычный запуск — по актуальному кэшу).
     """
     for attempt in range(ENSURE_ROLES_ATTEMPTS):
         with run_lock(cfg):
             st0 = load_state(cfg)
             gen = st0.get("models_gen", 0)
-            cache = None if (refresh and attempt == 0) else copy.deepcopy(st0.get("models"))
+            cache = None if refresh else copy.deepcopy(st0.get("models"))
         r = probe_roles(cfg, cache, probe)
         with run_lock(cfg):
             cur = load_state(cfg)

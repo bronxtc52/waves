@@ -14,7 +14,7 @@ import helpers
 from helpers import ROOT, good, write_json
 
 import wab
-from test_dash import dash
+from test_dash import FakeRich, dash, flatten
 
 
 def cfg_for(directory, roles=None, fallback=None):
@@ -279,6 +279,29 @@ class TestCacheRace(LaunchEnv):
         for k in self.KEYS:
             self.assertNotIn(k, st)
 
+    def test_refresh_never_uses_cache_on_retry(self):
+        wab.ensure_roles(self.cfg, probe=self.UP)
+        real = wab.probe_roles
+        caches, state = [], {"n": 0}
+
+        def interleaved(cfg, cache, probe=None):
+            state["n"] += 1
+            if state["n"] != 2:                   # вызов 2 — процесс B; в caches только пробы A
+                caches.append(cache)
+            r = real(cfg, cache, probe)
+            if state["n"] == 1:                   # во время проб A обычный B берёт старый кэш и публикует
+                wab.ensure_roles(self.cfg, probe=self.UP)
+            return r
+
+        with mock.patch.object(wab, "probe_roles", interleaved):
+            with self.assertRaises(SystemExit):
+                wab.ensure_roles(self.cfg, refresh=True, probe=self.DOWN)
+        self.assertGreaterEqual(len(caches), 2)
+        self.assertTrue(all(c is None for c in caches), caches)
+        st = wab.load_state(self.cfg)
+        for k in self.KEYS:
+            self.assertNotIn(k, st)
+
     def test_no_contention_bumps_generation_without_retries(self):
         probe = mock.Mock(side_effect=self.UP)
         wab.ensure_roles(self.cfg, probe=probe)
@@ -406,7 +429,11 @@ class TestDashRoles(Tmp):
         line = dash.roles_line(self.cfg, st)
         self.assertNotIn("fallback", line)
         self.assertIn("coder", line)
-        dash.header(self.cfg, st)  # не падает
+        with contextlib.ExitStack() as stack:  # rich в CI может не быть: заглушки как в test_dash
+            stack.enter_context(mock.patch.object(dash, "Text", FakeRich))
+            stack.enter_context(mock.patch.object(dash, "transcript_stats", lambda cwd: {"turns": 0}))
+            text = flatten(dash.header(self.cfg, st))
+        self.assertIn("coder", text)
 
 
 class TestDocs(unittest.TestCase):
