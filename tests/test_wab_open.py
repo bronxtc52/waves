@@ -79,6 +79,57 @@ class TestWabOpen(unittest.TestCase):
         self.assertNotIn("Нет активной волны", r.stdout)
         self.assertIn("Ошибка", r.stderr)
 
+    def _argv_tmux(self):
+        """Фальшивый tmux, пишущий каждый аргумент отдельной строкой и значение TMUX."""
+        fake = self.bin.parent / "argvbin"
+        fake.mkdir()
+        argv_log = self.bin.parent / "argv.log"
+        _exe(fake / "tmux", '#!/bin/sh\n{ echo "CALL TMUX=[${TMUX-}]"; '
+                            'for a in "$@"; do echo "ARG[$a]"; done; } >> ' + shlex.quote(str(argv_log))
+             + '\nexit 0\n')
+        return fake, argv_log
+
+    def _calls(self, argv_log):
+        calls = []
+        for line in argv_log.read_text(encoding="utf-8").splitlines():
+            if line.startswith("CALL "):
+                calls.append({"tmux": line[len("CALL TMUX=["):-1], "argv": []})
+            else:
+                calls[-1]["argv"].append(line[len("ARG["):-1])
+        return calls
+
+    def test_attach_uses_socket_of_current_server(self):
+        # внутри display-popup TMUX указывает на текущий (в т.ч. приватный) сервер: attach туда же
+        self._state()
+        fake, argv_log = self._argv_tmux()
+        sock = "/tmp/x y/O'B $s/sock"
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env["PATH"] = f"{fake}{os.pathsep}{env['PATH']}"
+        env["TMUX"] = f"{sock},123,0"
+        r = subprocess.run(["bash", str(self.install / "scripts" / "wab-open"), str(self.waves)],
+                           capture_output=True, text=True, env=env, input="\n", timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self._calls(argv_log)
+        has = [c for c in calls if "has-session" in c["argv"]]
+        att = [c for c in calls if "attach" in c["argv"]]
+        self.assertEqual(len(has), 1, calls)
+        self.assertEqual(len(att), 1, calls)
+        self.assertEqual(has[0]["argv"][:2], ["-S", sock])
+        self.assertEqual(att[0]["argv"], ["-S", sock, "attach", "-f", "ignore-size", "-t", "=wab-demo-w1"])
+        self.assertEqual(att[0]["tmux"], "")
+
+    def test_attach_without_tmux_has_no_socket(self):
+        self._state()
+        fake, argv_log = self._argv_tmux()
+        r = self.run_open(extra_bin=fake)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self._calls(argv_log)
+        self.assertTrue(calls)
+        for c in calls:
+            self.assertNotIn("-S", c["argv"])
+        att = [c for c in calls if "attach" in c["argv"]]
+        self.assertEqual(att[0]["argv"], ["attach", "-f", "ignore-size", "-t", "=wab-demo-w1"])
+
     def test_no_path_interpolated_into_python_source(self):
         text = (ROOT / "scripts" / "wab-open").read_text(encoding="utf-8")
         self.assertNotIn("'$here'", text)

@@ -383,5 +383,77 @@ class TestHandoffResume(_Base):
         self.assertIn("W1: BLOCKED", self.log())
         self.assertNotIn("перезапуск", self.log())
 
+
+class TestNotReadyRecovery(_Base):
+    """not_ready: владелец вручную вернул волну в работу (RUNNING) — надзор и контрольные точки снова идут."""
+
+    def setUp(self):
+        super().setUp()
+        self.texts = []
+        self.tokens = 1000
+        for name, kw in (("tmux_alive", {"return_value": True}),
+                         ("pane_text", {"return_value": "экран\n? for shortcuts"}),
+                         ("context_tokens", {"side_effect": lambda *a, **k: self.tokens}),
+                         ("send_text", {"side_effect": lambda *a, **k: self.texts.append(a)}),
+                         ("send_keys", {"return_value": None}),
+                         ("send_command", {"return_value": None})):
+            pt = mock.patch.object(wab, name, **kw)
+            pt.start()
+            self.addCleanup(pt.stop)
+        self.wdir = wab.wave_dir(self.cfg, "W1")
+        self.blocked = "BLOCKED: окно Claude не стало готовым, задача не отправлена"
+        self.st = {"current": "W1", "waves": {"W1": {
+            "tmux": "wab-demo-W1", "cwd": str(self.dir), "phase": "not_ready", "restarts": 0,
+            "notified": {"blocked": self.blocked}}}}
+
+    def tick(self, status):
+        (self.wdir / "status").write_text(status + "\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            return wab.tick(self.cfg, self.st)
+
+    def test_running_restores_phase_once_then_checkpoint(self):
+        self.assertTrue(self.tick("RUNNING"))
+        w = self.st["waves"]["W1"]
+        self.assertEqual(w["phase"], "running")
+        self.assertNotIn("blocked", w["notified"])
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "running")
+        self.assertTrue(self.tick("RUNNING"))
+        self.assertEqual(self.log().count("W1: восстановлена вручную, слежу дальше"), 1)
+        self.assertEqual(self.texts, [])
+        # переполнение контекста на следующем тике — запрошена контрольная точка
+        self.tokens = self.cfg["ctx_limit"]
+        self.assertTrue(self.tick("RUNNING"))
+        self.assertEqual(w["phase"], "checkpoint")
+        self.assertEqual(len(self.texts), 1)
+        self.assertIn("WAB-CHECKPOINT", self.texts[0][1])
+        self.assertEqual(self.log().count("восстановлена вручную"), 1)
+
+    def test_blocked_again_is_reported_after_recovery(self):
+        self.tick("RUNNING")
+        self.tick(self.blocked)
+        self.assertEqual(self.log().count(self.blocked), 1)
+
+    def test_other_statuses_keep_not_ready(self):
+        for status in ("BLOCKED: вопрос", self.blocked, "RESUMING", "STARTING", ""):
+            with self.subTest(status=status):
+                self.tokens = self.cfg["ctx_limit"] + 1
+                self.tick(status)
+                w = self.st["waves"]["W1"]
+                self.assertEqual(w["phase"], "not_ready")
+                self.assertEqual(self.texts, [])
+                self.assertNotIn("восстановлена вручную", self.log())
+
+    def test_done_and_dead_win_over_recovery(self):
+        self.tick("DONE")
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "done")
+        self.assertNotIn("восстановлена вручную", self.log())
+
+    def test_dead_session_not_recovered(self):
+        wab.tmux_alive.return_value = False
+        self.assertFalse(self.tick("RUNNING"))
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "dead")
+        self.assertNotIn("восстановлена вручную", self.log())
+
+
 if __name__ == "__main__":
     unittest.main()

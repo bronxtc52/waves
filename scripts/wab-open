@@ -10,7 +10,14 @@ if [ "$rc" -ne 0 ]; then
   echo "Ошибка: не удалось определить текущую волну (python3 завершился с кодом $rc, см. сообщение выше). Enter — закрыть." >&2
   read -r; exit "$rc"
 fi
-if [ -z "$name" ] || ! tmux has-session -t "=$name" 2>/dev/null; then
+# попап живёт внутри tmux: TMUX="сокет,pid,сессия" указывает на текущий (возможно, приватный -L/-S) сервер.
+# Обращаемся к нему же явно через -S, иначе после очистки TMUX attach ушёл бы на сокет по умолчанию.
+sock=()
+if [ -n "${TMUX:-}" ]; then
+  sock=(-S "${TMUX%%,*}")
+fi
+if [ -z "$name" ] || ! tmux ${sock[@]+"${sock[@]}"} has-session -t "=$name" 2>/dev/null; then
   echo "Нет активной волны (цепочка завершена или окно закрыто). Enter — закрыть."; read -r; exit 0
 fi
-TMUX= exec tmux attach -f ignore-size -t "=$name"
+# TMUX очищаем, чтобы tmux не отказал во вложенном подключении
+TMUX= exec tmux ${sock[@]+"${sock[@]}"} attach -f ignore-size -t "=$name"

@@ -551,6 +551,14 @@ def tick(cfg, st, waves_json=None):
         save_state(cfg, st)
         return True
 
+    if w["phase"] == "not_ready" and status == "RUNNING":
+        # владелец подключился и вручную отправил продолжение: без возврата в running
+        # контрольная точка больше не запрашивалась бы и контекст переполнился
+        w["phase"] = "running"
+        w["notified"].pop("blocked", None)  # будущий BLOCKED снова сообщится
+        event(cfg, f"{wave}: восстановлена вручную, слежу дальше")
+        save_state(cfg, st)
+
     txt = pane_text(name)
     tokens = context_tokens(w["cwd"])
     w["tokens"] = tokens
