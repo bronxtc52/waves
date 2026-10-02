@@ -4,6 +4,7 @@ import pathlib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import helpers
 from helpers import good
@@ -215,6 +216,127 @@ class TestBaseRefspec(unittest.TestCase):
         self.assertFalse((self.cfg["run_dir"] / "worktrees" / "W1").exists())
         branches = git("branch", "--list", "wab/*", cwd=self.checkout)
         self.assertEqual(branches, "")
+
+
+def _c_quote(path):
+    """Как git с core.quotePath: путь со спецсимволами в кавычках, не-ASCII байты — восьмерично."""
+    if all(0x20 <= b < 0x7f and b not in b'"\\' for b in path.encode()):
+        return path
+    out = []
+    for b in path.encode():
+        if b in b'"\\':
+            out.append("\\" + chr(b))
+        elif b == 0x0a:
+            out.append("\\n")
+        elif 0x20 <= b < 0x7f:
+            out.append(chr(b))
+        else:
+            out.append("\\%03o" % b)
+    return '"' + "".join(out) + '"'
+
+
+SPECIAL = {
+    "cyr": "волны прогон",
+    "quote": 'run "q"',
+    "backslash": "run\\back",
+    "space": "run with space",
+    "newline": "run\nline",
+}
+
+
+class TestSpecialPaths(unittest.TestCase):
+    """run_dir со спецсимволами: повторный вызов переиспользует worktree, восстановление работает."""
+    setUp = TestPrepareWorktree.setUp
+    _restore_env = TestPrepareWorktree._restore_env
+    _commit_in = TestPrepareWorktree._commit_in
+
+    def _cfg(self, key):
+        return dict(self.cfg, run_id=f"r-{key}", run_dir=self.root / SPECIAL[key] / "r")
+
+    def _branch(self, key):
+        return f"wab/demo/r-{key}/W1"
+
+    def test_reuse_and_restore(self):
+        import shutil
+        for key in SPECIAL:
+            with self.subTest(key=key):
+                cfg = self._cfg(key)
+                path = wab.prepare_worktree(cfg, "W1")
+                self.assertEqual(pathlib.Path(path), (cfg["run_dir"] / "worktrees" / "W1").resolve())
+                self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), self._branch(key))
+                sha = self._commit_in(path, "mine.txt")
+                self.assertEqual(wab.prepare_worktree(cfg, "W1"), path)
+                self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), self._branch(key))
+                shutil.rmtree(path)
+                self.assertEqual(wab.prepare_worktree(cfg, "W1"), path)
+                self.assertEqual(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD"), self._branch(key))
+                self.assertEqual(git("-C", path, "rev-parse", "HEAD"), sha)
+
+    def test_git_quoting_paths_without_z(self):
+        """Новые git берут путь в кавычки без -z (core.quotePath); с -z — никогда."""
+        real = wab._git
+
+        def fake(checkout, *args):
+            r = real(checkout, *args)
+            if args[:2] == ("worktree", "list") and "-z" not in args and r.returncode == 0:
+                lines = [("worktree " + _c_quote(l[len("worktree "):])) if l.startswith("worktree ") else l
+                         for l in r.stdout.split("\n")]
+                r.stdout = "\n".join(lines)
+            return r
+
+        with mock.patch.object(wab, "_git", fake):
+            for key in ("cyr", "quote", "backslash"):
+                with self.subTest(key=key):
+                    cfg = self._cfg(key)
+                    path = wab.prepare_worktree(cfg, "W1")
+                    self.assertEqual(wab.prepare_worktree(cfg, "W1"), path)
+
+
+class TestOldGit(unittest.TestCase):
+    """git < 2.36 не знает `worktree list -z`: понятная SystemExit с требованием версии."""
+    setUp = TestPrepareWorktree.setUp
+    _restore_env = TestPrepareWorktree._restore_env
+
+    def _fake(self, version):
+        real_git, real_sh = wab._git, wab.sh
+
+        def fake_git(checkout, *args):
+            if args[:2] == ("worktree", "list") and "-z" in args:
+                return subprocess.CompletedProcess(args, 129, "", "error: unknown switch `z'\n")
+            return real_git(checkout, *args)
+
+        def fake_sh(*args, **kw):
+            if args == ("git", "version"):
+                return subprocess.CompletedProcess(args, 0, f"git version {version}\n", "")
+            return real_sh(*args, **kw)
+        return mock.patch.multiple(wab, _git=fake_git, sh=fake_sh)
+
+    def test_old_git_refused_with_version(self):
+        with self._fake("2.35.1"):
+            with self.assertRaises(SystemExit) as cm:
+                wab.prepare_worktree(self.cfg, "W1")
+        msg = str(cm.exception)
+        self.assertIn("2.36", msg)
+        self.assertIn("2.35", msg)
+        self.assertFalse((self.cfg["run_dir"] / "worktrees" / "W1").exists())
+
+    def test_new_git_error_passed_through(self):
+        with self._fake("2.43.0"):
+            with self.assertRaises(SystemExit) as cm:
+                wab.prepare_worktree(self.cfg, "W1")
+        self.assertIn("git worktree list", str(cm.exception))
+        self.assertNotIn("нужен git", str(cm.exception))
+
+
+class TestParseWorktreesZ(unittest.TestCase):
+    def test_records_and_newline_in_path(self):
+        out = ("worktree /a\0HEAD 1\0branch refs/heads/main\0\0"
+               "worktree /b\nc\0HEAD 2\0detached\0\0"
+               "worktree /d \"e\"\\f\0HEAD 3\0branch refs/heads/x\0\0")
+        got = wab._parse_worktrees_z(out)
+        self.assertEqual(got, {pathlib.Path("/a"): "refs/heads/main",
+                               pathlib.Path("/b\nc"): None,
+                               pathlib.Path('/d "e"\\f'): "refs/heads/x"})
 
 
 if __name__ == "__main__":

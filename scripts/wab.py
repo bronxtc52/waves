@@ -12,6 +12,7 @@ handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне реп
 После DONE диспетчер закрывает окно волны и останавливается: следующую волну сам не
 запускает (сначала мердж PR и решение координатора), а печатает команду launch для неё.
 Нужен tmux >= 3.2: new-session принимает команду списком аргументов (3.0+) и ключ -e (3.2+).
+Нужен git >= 2.36: пути worktree читаются из `git worktree list --porcelain -z`.
 Импорт модуля ничего не запускает и не создаёт файлов.
 """
 import argparse
@@ -230,6 +231,41 @@ def _git(checkout, *args):
     return sh("git", "-C", str(checkout), *args, check=False)
 
 
+GIT_MIN = (2, 36)  # `git worktree list -z` появился в git 2.36
+
+
+def _git_version():
+    """Версия git кортежем (major, minor) или None, если разобрать не удалось."""
+    r = sh("git", "version", check=False)
+    m = re.search(r"(\d+)\.(\d+)", r.stdout or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _require_git_worktree_z():
+    """SystemExit с требованием версии, если git слишком стар для `worktree list -z`."""
+    v = _git_version()
+    if v is not None and v < GIT_MIN:
+        raise SystemExit(f"нужен git >= {GIT_MIN[0]}.{GIT_MIN[1]} (`git worktree list -z`), "
+                         f"установлен {v[0]}.{v[1]}; обновите git")
+
+
+def _parse_worktrees_z(out):
+    """Разбор `git worktree list --porcelain -z`: атрибуты разделены NUL, запись кончается пустым полем.
+
+    Возвращает {путь worktree (resolve): ref ветки или None}."""
+    paths = {}
+    cur = None
+    for field in out.split("\0"):
+        if field == "":
+            cur = None
+        elif field.startswith("worktree "):
+            cur = pathlib.Path(field[len("worktree "):]).resolve()
+            paths[cur] = None
+        elif field.startswith("branch ") and cur is not None:
+            paths[cur] = field[len("branch "):]
+    return paths
+
+
 def prepare_worktree(cfg, wave):
     """Готовит git worktree волны и возвращает его путь.
 
@@ -243,7 +279,7 @@ def prepare_worktree(cfg, wave):
     r = _git(checkout, "rev-parse", "--show-toplevel")
     if r.returncode != 0:
         raise SystemExit(f"checkout {checkout}: не git-репозиторий: {r.stderr.strip()}")
-    top = pathlib.Path(r.stdout.strip()).resolve()
+    top = pathlib.Path(r.stdout.removesuffix("\n")).resolve()
     if top != checkout.resolve():
         raise SystemExit(f"checkout {checkout}: это не корень git-checkout (корень — {top}); "
                          f"укажите в waves.json корень")
@@ -252,18 +288,12 @@ def prepare_worktree(cfg, wave):
     branch = f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
 
     def listing():
-        r = _git(checkout, "worktree", "list", "--porcelain")
+        # -z: путь отдаётся как есть, без кавычек и экранирования (core.quotePath), даже с переводом строки
+        r = _git(checkout, "worktree", "list", "--porcelain", "-z")
         if r.returncode != 0:
+            _require_git_worktree_z()
             raise SystemExit(f"git worktree list: {r.stderr.strip()}")
-        paths = {}
-        cur = None
-        for l in r.stdout.splitlines():
-            if l.startswith("worktree "):
-                cur = pathlib.Path(l[len("worktree "):]).resolve()
-                paths[cur] = None
-            elif l.startswith("branch ") and cur is not None:
-                paths[cur] = l[len("branch "):]
-        return paths
+        return _parse_worktrees_z(r.stdout)
 
     registered = listing()
     if wt in registered and wt.is_dir():
