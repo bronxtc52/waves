@@ -167,6 +167,18 @@ def waves_table(cfg, st):
     return tb
 
 
+def screen_text(name, rows=14, width=150):
+    """Хвост экрана волны для дашборда, вычищенный от секретов.
+
+    Захват с -J: мягкий перенос терминала не режет секрет на куски, которые шаблоны не узнают.
+    Вычистка — по всему тексту сразу и без лимита redact(); строки и ширина режутся после:
+    обрывок секрета на границе среза шаблоном уже не узнался бы. Жёсткий перенос (настоящий
+    перевод строки внутри секрета в самом выводе) так не склеить — это известное ограничение."""
+    clean = wab.redact(wab.pane_text(name, join=True), limit=sys.maxsize)
+    lines = [l for l in clean.splitlines() if l.strip()][-rows:]
+    return "\n".join(l[:width] for l in lines)
+
+
 def current_panel(cfg, st):
     wave = st.get("current")
     if not wave:
@@ -180,9 +192,7 @@ def current_panel(cfg, st):
     head.append(f"   статус: {status}", style="yellow" if status.startswith("BLOCKED") else "green")
     ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
-    lines = [l for l in wab.pane_text(w["tmux"]).splitlines() if l.strip()][-14:]
-    # сначала вычистка, потом срез под ширину: обрывок секрета на границе не узнаётся шаблоном
-    screen = Text("\n".join(wab.redact(l)[:150] for l in lines), style="grey78")
+    screen = Text(screen_text(w["tmux"]), style="grey78")
     return Panel(Group(head, Text(), ctx, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")

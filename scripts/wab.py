@@ -158,8 +158,12 @@ def tmux_alive(name):
     return sh("tmux", "has-session", "-t", sess_target(name), check=False).returncode == 0
 
 
-def pane_text(name):
-    r = sh("tmux", "capture-pane", "-p", "-t", pane_target(name), check=False)
+def pane_text(name, join=False):
+    """Текст панели. join=True — `capture-pane -J`: мягко перенесённые терминалом строки
+    склеиваются, и секрет, разрезанный переносом, redact() узнаёт целиком (для показа наружу).
+    Маркеры готовности ищутся на обычном захвате: им склейка не нужна."""
+    flags = ("-p", "-J") if join else ("-p",)
+    r = sh("tmux", "capture-pane", *flags, "-t", pane_target(name), check=False)
     return r.stdout if r.returncode == 0 else ""
 
 
