@@ -21,6 +21,7 @@ WAVE_REQUIRED = ("id", "title", "goal", "done_when", "check")
 
 _NAME = re.compile(r"[A-Za-z0-9._-]+")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+_BRANCH_BAD = re.compile(r"[\x00-\x20\x7f ~^:?*\[\\]|\.\.|@\{|//")
 _WAVE_ID = re.compile(r"[A-Za-z0-9_-]+")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -54,6 +55,8 @@ class _Checker:
             self.err(where, "строка не должна быть пустой")
         if rx is not None and not rx.fullmatch(value):
             self.err(where, f"значение «{value}» не соответствует формату {rx.pattern}")
+        if "\x00" in value:
+            self.err(where, "строка содержит NUL-символ")
         if not dot_only_ok and set(value) == {"."}:
             self.err(where, f"значение «{value}» не может состоять из одних точек")
         return value
@@ -77,6 +80,9 @@ class _Checker:
             self.err(where, "список не должен быть пустым")
         for i, item in enumerate(value):
             self.string(item, f"{where}[{i}]")
+        for i, item in enumerate(value):
+            if item in value[:i]:
+                self.err(f"{where}[{i}]", f"дубликат «{item}»")
         return list(value)
 
 
@@ -99,6 +105,8 @@ def _read(path):
     name = path.name
     try:
         raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raise ConfigError(f"{name}: файл не в кодировке UTF-8") from None
     except OSError as e:
         raise ConfigError(f"{name}: не удалось прочитать файл: {e.strerror or e}") from None
     try:
@@ -149,12 +157,19 @@ def load_waves(path):
         "run_id": c.string(data["run_id"], "run_id", _NAME, dot_only_ok=False),
         "repo": c.string(data["repo"], "repo", _REPO),
     }
+    if any(set(seg) == {"."} for seg in cfg["repo"].split("/")):
+        c.err("repo", "сегмент «.» или «..» недопустим, ожидается owner/name")
     checkout = c.string(data["checkout"], "checkout")
     if not pathlib.PurePath(checkout).is_absolute():
         c.err("checkout", "ожидается абсолютный путь")
     cfg["checkout"] = checkout
 
-    cfg["base_branch"] = c.string(data.get("base_branch", OPTIONAL_DEFAULTS["base_branch"]), "base_branch")
+    base = c.string(data.get("base_branch", OPTIONAL_DEFAULTS["base_branch"]), "base_branch")
+    if (base.startswith(("-", "/", ".")) or base.endswith(("/", ".", ".lock")) or base == "@"
+            or _BRANCH_BAD.search(base) or any(p.startswith(".") or p.endswith(".lock")
+                                                for p in base.split("/"))):
+        c.err("base_branch", f"«{base}» не годится как имя ветки")
+    cfg["base_branch"] = base
     cfg["fallback_model"] = c.string(data.get("fallback_model", OPTIONAL_DEFAULTS["fallback_model"]),
                                      "fallback_model")
     cfg["automerge"] = c.boolean(data.get("automerge", OPTIONAL_DEFAULTS["automerge"]), "automerge")

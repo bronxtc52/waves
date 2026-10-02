@@ -58,6 +58,13 @@ class TestCli(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("nope.json", r.stderr)
 
+    def test_validate_not_utf8(self):
+        p = self.dir / "waves.json"
+        p.write_bytes(b"\xff\xfe{}")
+        r = run("validate", str(p))
+        self.assertEqual(r.returncode, 2)
+        self.assertNotIn("Traceback", r.stderr)
+
     def test_import_has_no_side_effects(self):
         code = ("import sys, os; sys.path.insert(0, %r); before=set(os.listdir('.')); import wab; "
                 "assert set(os.listdir('.'))==before; print('ok')" % str(ROOT / "scripts"))

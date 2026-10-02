@@ -14,12 +14,12 @@ ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnul
 
 def _git(root, *args):
     return subprocess.run(["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@example.com",
-                           *args], env=ENV, capture_output=True, text=True)
+                           *args], env=ENV, capture_output=True, encoding="utf-8", errors="replace")
 
 
 def scan(root):
     """Вхождения запрещённых слов в отслеживаемых файлах root, кроме docs/ и этого теста."""
-    r = _git(root, "grep", "-niIE", PATTERN, "--", ".", ":(exclude)docs",
+    r = _git(root, "grep", "-niaE", PATTERN, "--", ".", ":(exclude)docs",
              ":(exclude)tests/test_no_private_infra.py")
     if r.returncode == 1:
         return []
@@ -59,6 +59,14 @@ class TestNoPrivateInfra(unittest.TestCase):
         hits = scan(self.copy)
         self.assertTrue(hits)
         self.assertTrue(any("scripts/leak.py" in h for h in hits), hits)
+
+    def test_binary_file_detected(self):
+        copy_tree(self.copy)
+        (self.copy / "scripts").mkdir(exist_ok=True)
+        (self.copy / "scripts" / "blob.bin").write_bytes(b"\x00\x01\xffserver-watchdog\x00\x02")
+        _git(self.copy, "add", "scripts/blob.bin")
+        hits = scan(self.copy)
+        self.assertTrue(any("scripts/blob.bin" in h for h in hits), hits)
 
     def test_every_word_matches(self):
         copy_tree(self.copy)

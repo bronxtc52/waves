@@ -97,6 +97,68 @@ class TestFileLevel(LoaderBase):
         self.fails(raw, "дубликат", "id")
 
 
+class TestFileReading(LoaderBase):
+    def test_not_utf8(self):
+        p = self.dir / "waves.json"
+        p.write_bytes(b"\xff\xfe{}")
+        with self.assertRaises(ConfigError) as cm:
+            load_waves(p)
+        self.assertIn("waves.json", str(cm.exception))
+        self.assertIn("UTF-8", str(cm.exception))
+
+    def test_directory_instead_of_file(self):
+        (self.dir / "waves.json").mkdir()
+        with self.assertRaises(ConfigError):
+            load_waves(self.dir / "waves.json")
+
+    def test_unreadable_file(self):
+        import os
+        p = write_json(self.dir, good())
+        p.chmod(0)
+        self.addCleanup(p.chmod, 0o644)
+        if os.access(p, os.R_OK):
+            self.skipTest("права не действуют (root)")
+        with self.assertRaises(ConfigError):
+            load_waves(p)
+
+
+class TestStrictValues(LoaderBase):
+    def test_repo_strict(self):
+        for bad in ("./name", "owner/..", "../x", "a/.", "a/b\n", "a b/c", "a/b/"):
+            d = good()
+            d["repo"] = bad
+            self.fails(d, "repo")
+
+    def test_base_branch_rules(self):
+        for bad in ("-x", "--upload-pack=x", "a b", "a..b", "a\x00b", "a\tb", "a\x7fb", "/a", "a/",
+                    "a//b", "a.lock", "a@{b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b",
+                    "@", ".a", "a/.b", "a."):
+            d = good()
+            d["base_branch"] = bad
+            self.fails(d, "base_branch")
+        for ok in ("main", "release/1.2", "feat_x-1"):
+            d = good()
+            d["base_branch"] = ok
+            self.assertEqual(self.load(d)["base_branch"], ok)
+
+    def test_nul_in_strings(self):
+        for key in ("chain", "run_id", "checkout", "fallback_model"):
+            d = good()
+            d[key] = d.get(key, "x") + "\x00x"
+            self.fails(d, key)
+        d = good()
+        d["waves"][0]["title"] = "a\x00b"
+        self.fails(d, "waves[0].title")
+        d = good()
+        d["roles"] = {"coder": "a\x00b"}
+        self.fails(d, "roles.coder")
+
+    def test_depends_on_duplicate(self):
+        d = good()
+        d["waves"][1]["depends_on"] = ["W1", "W1"]
+        self.fails(d, "waves[1].depends_on", "W1", "дубликат")
+
+
 class TestTopLevel(LoaderBase):
     def test_extra_key(self):
         d = good()
