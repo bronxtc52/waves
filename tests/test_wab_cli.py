@@ -113,6 +113,9 @@ class LaunchMocks:
         self.m["tmux_alive"].side_effect = lambda *a, **k: False
         self.m["prepare_worktree"].side_effect = lambda *a, **k: self.calls.append("prepare_worktree") or str(self.dir)
         self.m["wait_ready"].side_effect = lambda *a, **k: False
+        pt = helpers.stub_ensure_roles(wab)
+        pt.start()
+        self.addCleanup(pt.stop)
         pt = mock.patch.object(wab, "load_state", return_value={"current": None, "waves": {}})
         pt.start()
         self.addCleanup(pt.stop)

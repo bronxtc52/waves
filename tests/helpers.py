@@ -29,3 +29,9 @@ def write_json(directory, data, name="waves.json"):
     p = pathlib.Path(directory) / name
     p.write_text(data if isinstance(data, str) else json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return p
+
+
+def stub_ensure_roles(wab):
+    """Старые тесты launch не проверяют модели: ensure_roles подменён (claude -p не вызывается)."""
+    from unittest import mock
+    return mock.patch.object(wab, "ensure_roles", side_effect=lambda cfg, refresh=False: (dict(cfg["roles"]), {}))

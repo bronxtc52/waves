@@ -213,6 +213,15 @@ def events_panel(cfg, n=12):
     return Panel(t or Text("событий пока нет", style="grey50"), title="📜 События", border_style="blue")
 
 
+def roles_line(cfg, st):
+    """Роли и модели одной строкой; роль на fallback помечена «⚠ роль: было → стало (fallback)»."""
+    eff = st.get("roles_effective") or cfg["roles"]
+    fb = st.get("role_fallbacks") or {}
+    parts = [f"{r} {m}" for r, m in eff.items() if r not in fb]
+    marks = [f"⚠ {r}: {v['from']} → {v['to']} (fallback)" for r, v in fb.items()]
+    return "роли: " + " · ".join(parts + marks) if parts or marks else ""
+
+
 def header(cfg, st):
     waves = st["waves"]
     done = sum(1 for w in wab.wave_ids(cfg) if wab.read(wab.wave_path(cfg, w) / "status") == "DONE")
@@ -228,13 +237,16 @@ def header(cfg, st):
     t.append(f"·  ходов {turns}  ", style="cyan")
     t.append(f"·  порог {ktok(cfg['ctx_limit'])}  ", style="grey62")
     t.append(time.strftime("·  %H:%M:%S UTC", time.gmtime()), style="grey50")
+    t.append("\n")
+    fb = st.get("role_fallbacks") or {}
+    t.append(roles_line(cfg, st), style="bold yellow" if fb else "grey62")
     return t
 
 
 def render(cfg):
     st = wab.load_state(cfg)
     lay = Layout()
-    lay.split_column(Layout(Panel(header(cfg, st), border_style="bright_cyan"), size=3),
+    lay.split_column(Layout(Panel(header(cfg, st), border_style="bright_cyan"), size=4),
                      Layout(Panel(pipeline(cfg, st), title="Конвейер", border_style="cyan"), size=5),
                      Layout(Panel(waves_table(cfg, st), title="📊 Статистика волн", border_style="cyan"),
                             size=len(cfg["waves"]) + 6),

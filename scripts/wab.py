@@ -6,6 +6,7 @@
   wab.py watch  <waves.json>                           следить за текущей волной до DONE
   wab.py status <waves.json>                           статус одним экраном
   wab.py validate <waves.json>                         проверить конфиг и напечатать его
+  wab.py models <waves.json> [--refresh]               роли → модели с проверкой доступности и fallback
 
 Каждая сессия волны пишет $WAB_DIR/status (RUNNING | HANDOFF_READY | BLOCKED: … | DONE),
 handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне репозитория.
@@ -17,6 +18,7 @@ handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне реп
 """
 import argparse
 import contextlib
+import copy
 import fcntl
 import hashlib
 import json
@@ -41,6 +43,7 @@ TRUST_MARKERS = ("Yes, I trust this folder", "Do you trust the files")
 HANDOFF_TIMEOUT_MINUTES = 25   # сколько ждём handoff после запроса контрольной точки
 RELOADABLE = ("ctx_limit", "idle_minutes", "tick_seconds")  # что watch перечитывает на ходу
 CLEAR_SETTLE_SECONDS = 6       # пауза прототипа, проверена вживую; детерминированный сигнал окончания /clear — волна W3
+PROBE_TIMEOUT_SECONDS = 120    # проверка модели: один короткий `claude -p`
 RUN_LOCK_TIMEOUT_SECONDS = 30  # дольше блокировку прогона не ждём: зависший wab.py не вешает launch навсегда
 
 
@@ -503,6 +506,9 @@ def launch(cfg, wave, prompt_file):
     if not prompt:
         raise SystemExit(f"файл промпта {prompt_file} пустой")
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
+    # модели ролей — до резерва и вне блокировки: проверка долгая, а блокировку ждут 30 с
+    roles, _ = ensure_roles(cfg)
+    wave_obj = next(w for w in cfg["waves"] if w["id"] == wave)
     # проверка и резерв — одним шагом под блокировкой прогона: иначе два координатора при
     # пустом current оба пройдут проверку и запустят две волны, а current достанется последней
     with run_lock(cfg):
@@ -533,8 +539,9 @@ def launch(cfg, wave, prompt_file):
         wdir = wave_dir(cfg, wave)
         cwd = prepare_worktree(cfg, wave)
         (wdir / "status").write_text("STARTING\n", encoding="utf-8")
-        cmd = ["claude", "--permission-mode", "auto", "--append-system-prompt-file", str(PROTOCOL),
-               "--name", f"wab-{cfg['chain']}-{wave}"]
+        sp = wdir / "system-prompt.md"
+        sp.write_text(system_prompt_text(cfg, wave_obj, wdir, cwd, roles), encoding="utf-8")
+        cmd = wave_argv(cfg, wave, roles, sp)
         sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
            "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
     except BaseException:
@@ -555,6 +562,135 @@ def launch(cfg, wave, prompt_file):
     _update_wave(cfg, wave, phase="running")
     event(cfg, f"{wave}: запущена в tmux {name}", trusted=f", cwd {cwd}")
     return True
+
+
+# ---------- роли, модели, системная инструкция ----------
+
+def agents_json(roles):
+    """JSON для `claude --agents`: субагенты волны на моделях ролей (roles — эффективные модели)."""
+    agents = {
+        "wave-tester": {
+            "description": "Тестер волны: свежий контекст, гоняет тесты и сценарии «Готово, когда», отвечает PASS/FAIL.",
+            "prompt": ("Ты тестер волны. Контекста работы кодера у тебя нет — это намеренно. Тебе дадут цель волны, "
+                       "критерии «Готово, когда» и команду проверки. Запусти тесты и пройди сценарии «Готово, когда» "
+                       "на живых данных. Ответ: PASS или FAIL, затем вывод команд (хвост, если он длинный) и какие "
+                       "сценарии не прошли. Код и тесты НЕ меняй."),
+            "tools": ["Read", "Grep", "Glob", "Bash"],
+            "model": roles["tester"],
+        },
+        "wave-reviewer": {
+            "description": "Ревьюер волны: сверяет дифф с целью и «Готово, когда», находки P1/P2.",
+            "prompt": ("Ты ревьюер волны. Тебе дадут путь к файлу с диффом (кодер сохраняет его туда), цель волны и "
+                       "«Готово, когда». Сверь дифф с целью и критериями, найди ошибки, пропущенные случаи и "
+                       "расхождения с требованиями. Каждую находку давай как P1 (блокирует) или P2 (желательно), с "
+                       "файлом:строкой и сценарием, на котором это ломается. Нет находок — скажи прямо. Код НЕ меняй."),
+            "tools": ["Read", "Grep", "Glob"],
+            "model": roles["reviewer"],
+        },
+        "wave-reader": {
+            "description": "Читатель: читает большие файлы и коротко отвечает на заданный вопрос.",
+            "prompt": ("Ты читатель больших файлов. Тебе дадут путь и вопрос. Прочитай файл и ответь коротко и "
+                       "точно на вопрос, без пересказа всего файла; укажи файл:строку, откуда взят ответ."),
+            "tools": ["Read", "Grep", "Glob"],
+            "model": roles["reader"],
+        },
+    }
+    return json.dumps(agents, ensure_ascii=False)
+
+
+def system_prompt_text(cfg, wave_obj, wdir, cwd, roles):
+    """Системная инструкция волны: PROTOCOL.md + раздел «Контекст волны»."""
+    w = wave_obj
+    done = "\n".join(f"- {d}" for d in w["done_when"])
+    deps = ", ".join(w["depends_on"]) or "нет"
+    ctx = (f"## Контекст волны\n\n"
+           f"- Волна: {w['id']} — {w['title']}\n"
+           f"- Цель: {w['goal']}\n"
+           f"- Готово, когда:\n{done}\n"
+           f"- Команда проверки: `{w['check']}`\n"
+           f"- Зависит от: {deps}\n"
+           f"- Репозиторий: {cfg['repo']}\n"
+           f"- Базовая ветка (PR сюда): {cfg['base_branch']}\n"
+           f"- Каталог волны ($WAB_DIR): {wdir}\n"
+           f"- Рабочая копия: {cwd}\n"
+           f"- Модели ролей: " + ", ".join(f"{r}={m}" for r, m in roles.items()) + "\n")
+    return PROTOCOL.read_text(encoding="utf-8").rstrip() + "\n\n" + ctx
+
+
+def wave_argv(cfg, wave, roles, system_prompt_path):
+    """Команда запуска сессии волны: кодер на своей модели, роли — субагентами, AskUserQuestion запрещён."""
+    return ["claude", "--model", roles["coder"], "--permission-mode", "auto",
+            "--append-system-prompt-file", str(system_prompt_path),
+            "--agents", agents_json(roles), "--disallowedTools", "AskUserQuestion",
+            "--name", f"wab-{cfg['chain']}-{wave}"]
+
+
+def probe_model(model, timeout=PROBE_TIMEOUT_SECONDS):
+    """Доступна ли модель: короткий `claude -p`. (ok, detail); вывод модели и stderr не возвращаем."""
+    try:
+        r = subprocess.run(["claude", "-p", "--model", model, "--no-session-persistence",
+                            "Ответь одним словом: ok"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "timeout"
+    except FileNotFoundError:
+        return False, "claude не найден"
+    return r.returncode == 0, f"rc={r.returncode}"
+
+
+def resolve_roles(cfg, st, probe=None):
+    """Эффективные модели ролей. Недоступная модель заменяется cfg['fallback_model'].
+
+    Результаты проверок кэшируются в st['models'] (повторно не проверяются); на успехе пишет
+    st['roles_effective'] и st['role_fallbacks']. Если нужный fallback тоже недоступен — SystemExit,
+    st не меняется (следующий запуск проверит заново). Блокировку прогона не берёт: вызовы долгие.
+    """
+    probe = probe or probe_model
+    models = copy.deepcopy(st.get("models") or {})
+    roles = cfg["roles"]
+
+    def check(model):
+        if model not in models:
+            ok, detail = probe(model)
+            models[model] = {"ok": bool(ok), "detail": detail, "checked": time.time()}
+            return True
+        return False
+
+    fb = cfg["fallback_model"]
+    for model in dict.fromkeys(roles.values()):
+        if check(model) and not models[model]["ok"]:
+            users = ", ".join(r for r, m in roles.items() if m == model)
+            event(cfg, f"модель {model} недоступна ({models[model]['detail']}): роли {users} → fallback {fb}")
+    effective, fallbacks = {}, {}
+    for role, model in roles.items():
+        if models[model]["ok"]:
+            effective[role] = model
+            continue
+        check(fb)
+        if not models[fb]["ok"]:
+            raise SystemExit(f"модель {model} (роль {role}) недоступна, и fallback_model {fb} тоже "
+                             f"({models[fb]['detail']}); проверьте вход и доступ: claude -p --model {fb} ok")
+        effective[role] = fb
+        fallbacks[role] = {"from": model, "to": fb}
+    st["models"] = models
+    st["roles_effective"] = effective
+    st["role_fallbacks"] = fallbacks
+    return effective
+
+
+def ensure_roles(cfg, refresh=False):
+    """Проверить модели вне блокировки прогона (вызовы долгие) и записать итог в state под ней."""
+    with run_lock(cfg):
+        st = copy.deepcopy(load_state(cfg))
+    if refresh:
+        st.pop("models", None)
+    roles = resolve_roles(cfg, st)
+    with run_lock(cfg):
+        cur = load_state(cfg)
+        for k in ("models", "roles_effective", "role_fallbacks"):
+            cur[k] = st[k]
+        save_state(cfg, cur)
+    return roles, st["role_fallbacks"]
 
 
 # ---------- надзор ----------
@@ -742,6 +878,13 @@ def status_cmd(cfg):
               f"restarts={w['restarts']} status={redact(read(wave_path(cfg, wave) / 'status'))}")
 
 
+def models_cmd(cfg, refresh=False):
+    roles, fallbacks = ensure_roles(cfg, refresh=refresh)
+    for role, model in roles.items():
+        fb = fallbacks.get(role)
+        print(f"{role}: {model}" + (f"  (fallback, {fb['from']} недоступна)" if fb else ""))
+
+
 # ---------- командная строка ----------
 
 def build_parser():
@@ -757,6 +900,9 @@ def build_parser():
     s.add_argument("waves_json")
     s = sub.add_parser("validate", help="проверить waves.json и напечатать нормализованный конфиг")
     s.add_argument("waves_json")
+    s = sub.add_parser("models", help="роли → модели: проверить доступность, подставить fallback")
+    s.add_argument("waves_json")
+    s.add_argument("--refresh", action="store_true", help="сбросить кэш проверок и проверить заново")
     return p
 
 
@@ -784,6 +930,8 @@ def main(argv=None):
         watch(cfg, args.waves_json)
     elif args.cmd == "status":
         status_cmd(cfg)
+    elif args.cmd == "models":
+        models_cmd(cfg, refresh=args.refresh)
     return 0
 
 
