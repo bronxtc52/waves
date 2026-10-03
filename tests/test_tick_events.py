@@ -392,7 +392,7 @@ class TestHandoffResume(_Base):
         self.assertEqual(self.kinds(), ["command"])
         self.assertEqual(self.calls[0][1:], ("wab-demo-W1", "/clear"))
         before = self.disk_at[0][1]
-        self.assertEqual((before["phase"], before["clear_sent"]), ("clearing", False))
+        self.assertEqual((before["phase"], before["clear_sent"]), ("clearing", "sending"))
         self.assertIn("clear_at", before)
         self.assertEqual((w["phase"], w["clear_sent"]), ("clearing", True))
         saved = wab.load_state(self.cfg)["waves"]["W1"]

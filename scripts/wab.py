@@ -1294,6 +1294,17 @@ def tick(cfg, st, waves_json=None):
         w["pre_clear"] = snapshot_transcripts(w["cwd"])  # до save_state и /clear
         write_continue_prompt(cfg, wave, wdir)  # до /clear: файл должен лежать, когда окно очищено
         save_state(cfg, st)
+    if w["phase"] == "clearing" and w.get("clear_sent") == "sending":
+        # диспетчер упал во время ввода /clear: текст мог попасть в поле без Enter. Повтор дал бы «/clear/clear»,
+        # а продолжение ушло бы в старую сессию; await_session и pre_clear не трогаем
+        msg = ("BLOCKED: перезапуск диспетчера во время отправки /clear; проверьте окно: очистите поле ввода, "
+               "отправьте /clear, затем текст продолжения" + continue_status_note(cfg, wave))
+        event(cfg, f"{wave}: {msg}; {attach}", trusted=continue_hint(cfg, wave, wdir))
+        w["phase"] = "not_ready"
+        w["notified"]["blocked"] = msg
+        (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        save_state(cfg, st)
+        return True
     if w["phase"] in ("clearing", "resuming") and (not w.get("await_session")
                                                    or not (wdir / CONTINUE_FILE).exists()):
         # состояние от версии без флага или файла: после /clear старый журнал мерить нельзя
@@ -1329,7 +1340,9 @@ def tick(cfg, st, waves_json=None):
     if w["phase"] == "clearing":
         if not w.get("clear_sent", True):
             # и после перезапуска диспетчера между сохранением выше и доставкой; пауза считается от отправки
+            # "sending" до ввода: падение между текстом и Enter не повторяется вслепую (ветка выше)
             w["clear_at"] = now
+            w["clear_sent"] = "sending"
             save_state(cfg, st)
             send_command(name, "/clear")
             w["clear_sent"] = True

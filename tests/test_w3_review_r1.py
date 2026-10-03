@@ -328,3 +328,56 @@ class TestResumingConfirmedByJournal(TestAwaitInvariant):
         w = self.tick(self.resuming(), "RUNNING")
         self.assertEqual(w["phase"], "not_ready")
         self.assertTrue((self.wdir / "status").read_text(encoding="utf-8").startswith("BLOCKED"))
+
+
+class TestClearSendAmbiguity(TestAwaitInvariant):
+    """Падение между вводом /clear и Enter: повторный ввод слепо не делается."""
+
+    def test_crash_mid_send_leaves_sending_and_next_tick_blocks_without_resend(self):
+        def crash(*a, **k):
+            self.cmds.append(a)
+            raise KeyboardInterrupt  # падение watch после текста, до Enter
+        wab.send_command.side_effect = crash
+        st = self.st("clearing", clear_sent=False, clear_at=1.0, await_session=True, pre_clear=["old"])
+        with self.assertRaises(KeyboardInterrupt):
+            self.tick(st, "HANDOFF_READY")
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["clear_sent"], "sending")
+        self.assertEqual(len(self.cmds), 1)
+        st2 = wab.load_state(self.cfg)
+        w = self.tick(st2, "HANDOFF_READY")
+        self.assertEqual(len(self.cmds), 1)  # /clear не повторён
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertTrue(w["await_session"])
+        self.assertEqual(w["pre_clear"], ["old"])
+        status = (self.wdir / "status").read_text(encoding="utf-8")
+        self.assertTrue(status.startswith("BLOCKED: перезапуск диспетчера во время отправки /clear"))
+        self.assertEqual(w["notified"]["blocked"], status.strip())
+
+    def test_normal_path_false_to_sending_to_true_then_continue(self):
+        seen = []
+        wab.send_command.side_effect = lambda *a, **k: seen.append(
+            wab.load_state(self.cfg)["waves"]["W1"]["clear_sent"])
+        st = self.st("clearing", clear_sent=False, clear_at=1.0, await_session=True, pre_clear=["old"])
+        w = self.tick(st, "HANDOFF_READY")
+        self.assertEqual((seen, w["clear_sent"]), (["sending"], True))
+        w["clear_at"] = time.time() - wab.CLEAR_SETTLE_SECONDS - 1
+        w = self.tick(st, "HANDOFF_READY")
+        self.assertEqual(w["phase"], "running")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_state_without_clear_sent_key_behaves_as_before(self):
+        st = self.st("clearing", clear_at=1.0, await_session=True, pre_clear=["old"])
+        w = self.tick(st, "HANDOFF_READY")
+        self.assertEqual(self.cmds, [])
+        self.assertEqual(w["phase"], "running")
+
+    def test_manual_recovery_binds_new_session_by_marker(self):
+        st = self.st("clearing", clear_sent="sending", clear_at=1.0, await_session=True, pre_clear=["old"])
+        w = self.tick(st, "HANDOFF_READY")
+        self.assertEqual(w["phase"], "not_ready")
+        self.journal("new", [user(f"{MARK} продолжаем"), assistant(0, 0, 50)], mtime=2000)
+        w = self.tick(st, "RUNNING")
+        self.assertEqual(w["phase"], "running")
+        w = self.tick(st, "RUNNING")
+        self.assertEqual((w["sessions"], w["await_session"]), (["old", "new"], False))
+        self.assertNotIn("pre_clear", w)
