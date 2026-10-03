@@ -30,7 +30,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 WAB = ROOT / "scripts" / "wab.py"
 FAKES = pathlib.Path(__file__).resolve().parent / "fakes"
 REQUIRED = os.environ.get("WAB_E2E_REQUIRED") == "1"
-TEST_SECONDS = 120   # дедлайн одного сценария целиком
+TEST_SECONDS = 180   # дедлайн одного сценария целиком (локально ~30 с; запас на медленный CI)
 CHAIN, RUN_ID, REPO = "e2e", "run1", "e2e-owner/demo"
 
 _spec = importlib.util.spec_from_file_location("fake_gh", FAKES / "fake_gh.py")
