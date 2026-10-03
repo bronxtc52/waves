@@ -1,0 +1,46 @@
+{
+  "chain": "hello",
+  "run_id": "2026-10-03-hello",
+  "repo": "your-name/your-repo",
+  "checkout": "/home/you/src/your-repo",
+  "base_branch": "main",
+  "automerge": false,
+  "ctx_limit": 300000,
+  "idle_minutes": 12,
+  "tick_seconds": 60,
+  "fallback_model": "opus",
+  "roles": {
+    "architect": "fable",
+    "coder": "opus",
+    "tester": "sonnet",
+    "reviewer": "fable",
+    "reader": "haiku"
+  },
+  "plan_sha256": "bee825bd8ba982c6bab2487852b95db5bda4eee23dbefda5ad18bc7de8cd3d0e",
+  "waves": [
+    {
+      "id": "W1",
+      "title": "hello.py с тестом",
+      "goal": "Добавить скрипт hello.py, который печатает hello, и тест на него.",
+      "done_when": [
+        "python3 hello.py печатает hello",
+        "тест tests/test_hello.py проходит",
+        "PR в main открыт, CI зелёный"
+      ],
+      "check": "python3 -m unittest discover -s tests",
+      "depends_on": []
+    },
+    {
+      "id": "W2",
+      "title": "флаг --name",
+      "goal": "Добавить в hello.py флаг --name: python3 hello.py --name X печатает hello, X.",
+      "done_when": [
+        "без флага поведение прежнее (hello)",
+        "с флагом --name X печатается hello, X",
+        "тесты на оба случая проходят, PR в main открыт, CI зелёный"
+      ],
+      "check": "python3 -m unittest discover -s tests",
+      "depends_on": ["W1"]
+    }
+  ]
+}
