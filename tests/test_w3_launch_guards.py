@@ -256,6 +256,7 @@ class TestInterruptedLaunch(_Base):
 
 
 class TestDispatcherLock(_Base):
+    @helpers.deadline(10)
     def test_second_watch_refused_and_lock_released(self):
         with wab.dispatcher_lock(self.cfg):
             with mock.patch.object(wab, "require_tmux"), mock.patch.object(wab, "tick") as tick:
@@ -267,6 +268,7 @@ class TestDispatcherLock(_Base):
         with wab.dispatcher_lock(self.cfg):
             pass   # снят после выхода
 
+    @helpers.deadline(10)
     def test_watch_holds_lock_for_whole_loop_and_releases(self):
         seen = []
 

@@ -1,7 +1,9 @@
 """Общие помощники тестов: хороший конфиг и запись waves.json во временный каталог."""
+import contextlib
 import copy
 import json
 import pathlib
+import signal
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -53,3 +55,17 @@ def stub_ensure_roles(wab):
     return _Patches(
         mock.patch.object(wab, "ensure_roles", side_effect=lambda cfg, refresh=False: (dict(cfg["roles"]), {})),
         mock.patch.object(wab, "require_tmux", return_value=None))
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Ограничение времени теста (годится и как декоратор). SIGALRM (Linux и macOS): зависший системный вызов превращается в провал теста."""
+    def boom(signum, frame):
+        raise AssertionError(f"не уложился в {seconds} с (повисло)")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)

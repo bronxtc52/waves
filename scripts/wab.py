@@ -316,9 +316,11 @@ class TranscriptCache:
             with open(path, "rb") as f:
                 if e["head"] is not None:  # тот же inode и не короче, но переписан на месте?
                     length, digest = e["head"]
+                    f.seek(0)
                     if hashlib.sha1(f.read(length)).hexdigest() != digest:
                         e = self.entries[path] = self._blank(key)
                 if e["offset"] is None:
+                    f.seek(0)  # после сверки хеша позиция не в начале: иначе в head попадает середина файла
                     head = f.read(min(HEAD_BYTES, stt.st_size))
                     e["head"] = (len(head), hashlib.sha1(head).hexdigest())
                     start = 0
@@ -769,7 +771,8 @@ def check_plan(cfg):
         raise SystemExit(f"BLOCKED: plan changed since approval: {why} (файл {path})")
 
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        # O_NONBLOCK: FIFO без писателя вечно ждёт при открытии; тип проверяется по fstat ниже
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     except FileNotFoundError:
         refuse("файла waves.md нет")
     except OSError as e:
@@ -1076,6 +1079,14 @@ def _has_line_break(s):
     return len(lines) > 1 or (bool(lines) and lines[0] != s)
 
 
+def _await_new_session(w, now):
+    """Инвариант: с момента фазы clearing волна ждёт новую сессию. Флаг сохраняется до /clear и
+    снимается только привязкой новой сессии по метке: ни not_ready, ни ручное RUNNING его не снимают,
+    иначе по старому журналу с контекстом выше порога сразу запросилась бы контрольная точка."""
+    w["await_session"] = True
+    w["await_at"] = now
+
+
 def tick(cfg, st, waves_json=None):
     wave = st.get("current")
     if not wave:
@@ -1153,6 +1164,11 @@ def tick(cfg, st, waves_json=None):
         w["phase"] = "clearing"
         w["clear_at"] = now
         w["clear_sent"] = False
+        _await_new_session(w, now)
+        save_state(cfg, st)
+    if w["phase"] in ("clearing", "resuming") and not w.get("await_session"):
+        # состояние от версии без флага: после /clear старый журнал мерить нельзя
+        _await_new_session(w, now)
         save_state(cfg, st)
     if w["phase"] == "resuming":
         # диспетчер упал между сохранением и подтверждением доставки: продолжение могло дойти, а могло нет

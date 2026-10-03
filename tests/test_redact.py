@@ -4,8 +4,10 @@
 функцией, и по путям наружу: event() (events.log и экран) и dash.screen_text()."""
 import contextlib
 import io
-import tempfile
 import pathlib
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -135,9 +137,18 @@ class TestRedactLinear(unittest.TestCase):
     """Шаблоны не должны вести себя квадратично: до W3 300 КБ без «@» занимали ~115 с."""
 
     def timed(self, text):
-        t = time.monotonic()
-        wab.redact(text, limit=10_000)
-        return time.monotonic() - t
+        """Время redact() в дочернем процессе: регулярное выражение не прерывается сигналом, поэтому
+        регрессия должна падать по timeout подпроцесса, а не вешать прогон тестов."""
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import wab; text = sys.stdin.read(); "
+                "t = time.monotonic(); wab.redact(text, limit=10_000); print(time.monotonic() - t)")
+        scripts = str(pathlib.Path(helpers.__file__).resolve().parent.parent / "scripts")
+        try:
+            r = subprocess.run([sys.executable, "-B", "-c", code, scripts], input=text, capture_output=True,
+                               text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("redact не уложился в 30 с на входе 300 КБ (квадратичный шаблон?)")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return float(r.stdout.strip())
 
     def test_300kb_without_at(self):
         self.assertLess(self.timed("word.another-one_x " * 16_000), 1.0)
