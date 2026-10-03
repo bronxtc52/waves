@@ -379,6 +379,57 @@ class TestSendingWindow(_InterruptedBase):
         self.assertIn("kill-session", status)
 
 
+class TestLegacyStarting(_InterruptedBase):
+    """Запись до W3: фаза starting без ключа sessions — launch мог успеть отправить промпт."""
+
+    def setUp(self):
+        super().setUp()
+        self.st["waves"]["W1"].pop("sessions")
+
+    def test_tick_blocked_without_kill_advice(self):
+        for status in (None, "STARTING"):
+            with self.subTest(status=status):
+                self.st["waves"]["W1"].update(phase="starting", launcher_pid=self.dead_pid, notified={})
+                wdir = wab.wave_path(self.cfg, "W1")
+                wdir.mkdir(parents=True, exist_ok=True)
+                if status:
+                    (wdir / "status").write_text(status + "\n", encoding="utf-8")
+                self.assertTrue(self.tick())
+                w = self.st["waves"]["W1"]
+                self.assertEqual(w["phase"], "not_ready")
+                self.assertTrue(w.get("prompt_maybe_sent"))
+                self.assertNotIn("launcher_pid", w)
+                text = (wdir / "status").read_text(encoding="utf-8")
+                self.assertTrue(text.startswith("BLOCKED: launch (версия до W3)"), text)
+                self.assertNotIn("kill-session", text)
+                self.assertIn("first-prompt.md", text)
+
+    def test_tick_agent_status_means_running_and_kept(self):
+        wdir = wab.wave_path(self.cfg, "W1")
+        wdir.mkdir(parents=True, exist_ok=True)
+        (wdir / "status").write_text("RUNNING\n", encoding="utf-8")
+        self.assertTrue(self.tick())
+        w = self.st["waves"]["W1"]
+        self.assertEqual(w["phase"], "running")
+        self.assertTrue(w.get("prompt_maybe_sent"))
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RUNNING")
+        self.assertNotIn("BLOCKED", self.log())
+        self.assertIn("запись до W3", self.log())
+
+    def test_check_launchable_no_kill_advice(self):
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        msg = str(cm.exception)
+        self.assertNotIn("kill-session", msg)
+        self.assertIn("Не закрывайте", msg)
+
+    def test_new_format_still_advises_kill(self):
+        self.st["waves"]["W1"]["sessions"] = ["s"]
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        self.assertIn("kill-session", str(cm.exception))
+
+
 class TestLaunchSendingPhase(_Base):
     def test_sending_saved_and_first_prompt_written_before_send_text(self):
         seen = {}

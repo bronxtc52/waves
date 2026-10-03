@@ -782,9 +782,13 @@ def _release_reservation(cfg, wave, prev_current, prev_rec):
 
 
 def _prompt_maybe_sent(rec):
-    """Первый промпт мог быть отправлен: флаг ставится до send_text; sending — для записей без флага."""
+    """Первый промпт мог быть отправлен: флаг ставится до send_text; sending — для записей без флага.
+
+    Запись до W3 (фаза starting без ключа sessions) тоже: старый launch слал промпт, оставаясь в starting.
+    """
     rec = rec or {}
-    return bool(rec.get("prompt_maybe_sent")) or rec.get("phase") == "sending"
+    return bool(rec.get("prompt_maybe_sent")) or rec.get("phase") == "sending" \
+        or (rec.get("phase") == "starting" and "sessions" not in rec)
 
 
 def _check_launchable(cfg, st, wave, name):
@@ -1257,6 +1261,25 @@ def tick(cfg, st, waves_json=None):
             return True
         msg = (f"BLOCKED: launch прерван при отправке задачи; проверьте окно (tmux attach -t ={name}): "
                f"если задачи нет — отправьте текст из {wdir / 'first-prompt.md'}")
+        w["phase"] = "not_ready"
+        w["notified"]["blocked"] = msg
+        (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        event(cfg, f"{wave}: {msg}")
+        save_state(cfg, st)
+        return True
+
+    if w.get("phase") == "starting" and "sessions" not in w:
+        # запись до W3: старый launch слал промпт, оставаясь в starting, — доставка неоднозначна.
+        # Привязки журнала нет, метку не проверяем; совета убить окно нет
+        w.pop("launcher_pid", None)
+        w["prompt_maybe_sent"] = True
+        if status not in ("", "STARTING"):  # агент уже писал статус сам — задача дошла, не затираем
+            w["phase"] = "running"
+            event(cfg, f"{wave}: запись до W3: launch прерван, задача, похоже, дошла — слежу дальше")
+            save_state(cfg, st)
+            return True
+        msg = (f"BLOCKED: launch (версия до W3) прерван, задача могла уйти; проверьте окно "
+               f"(tmux attach -t ={name}): если задачи нет — отправьте текст из {wdir / 'first-prompt.md'}")
         w["phase"] = "not_ready"
         w["notified"]["blocked"] = msg
         (wdir / "status").write_text(msg + "\n", encoding="utf-8")
