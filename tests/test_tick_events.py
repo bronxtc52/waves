@@ -457,7 +457,7 @@ class TestHandoffResume(_Base):
         self.assertNotIn("text", self.kinds())
         self.assertEqual(w["phase"], "not_ready")
         status = (wdir / "status").read_text(encoding="utf-8").strip()
-        self.assertEqual(status, "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено")
+        self.assertTrue(status.startswith("BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"))
         self.assertEqual(w["restarts"], 2)
         self.assertIn("W1: BLOCKED", self.log())
         self.assertNotIn("перезапуск", self.log())

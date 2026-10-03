@@ -107,6 +107,62 @@ class TestAwaitInvariant(_Tmp):
                 self.assertTrue(w.get("await_session"))
 
 
+class TestContinuePromptFile(TestAwaitInvariant):
+    """Текст продолжения лежит в файле волны до /clear; BLOCKED и событие таймаута называют файл."""
+
+    def events(self):
+        f = self.cfg["run_dir"] / "events.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def check_blocked(self, w):
+        path = self.wdir / wab.CONTINUE_FILE
+        status = (self.wdir / "status").read_text(encoding="utf-8")
+        self.assertEqual(len(status.strip().splitlines()), 1)
+        self.assertIn(wab.CONTINUE_FILE, status)
+        self.assertIn(MARK, status)
+        self.assertIn(str(path), self.events())
+
+    def test_file_written_before_clear_and_starts_with_marker(self):
+        seen = []
+        wab.send_command.side_effect = lambda *a, **k: seen.append(
+            (self.wdir / wab.CONTINUE_FILE).read_text(encoding="utf-8"))
+        self.tick(self.st("checkpoint", checkpoint_sent=True), "HANDOFF_READY")
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].startswith(MARK), seen[0])
+        self.assertIn(f"{self.wdir}/handoff.md", seen[0])
+
+    def test_sent_text_equals_file(self):
+        st = self.st("checkpoint", checkpoint_sent=True)
+        self.tick(st, "HANDOFF_READY")
+        st["waves"]["W1"]["clear_at"] = time.time() - wab.CLEAR_SETTLE_SECONDS - 1
+        self.tick(st, "HANDOFF_READY")
+        text = (self.wdir / wab.CONTINUE_FILE).read_text(encoding="utf-8").strip()
+        self.assertEqual(self.sent[0][1], text)
+
+    def test_blocked_from_resuming_names_file(self):
+        w = self.tick(self.st("resuming", clear_sent=True, clear_at=1.0), "RUNNING")
+        self.assertEqual(w["phase"], "not_ready")
+        self.check_blocked(w)
+
+    def test_blocked_from_clearing_timeout_names_file(self):
+        self.screen = "пусто"
+        st = self.st("checkpoint", checkpoint_sent=True)
+        self.tick(st, "HANDOFF_READY")
+        st["waves"]["W1"]["clear_at"] = time.time() - wab.READY_AFTER_CLEAR_SECONDS - 5
+        w = self.tick(st, "HANDOFF_READY")
+        self.assertEqual(w["phase"], "not_ready")
+        self.check_blocked(w)
+
+    def test_await_timeout_event_names_file(self):
+        st = self.st("running", await_session=True, await_at=time.time() - 3600)
+        self.tick(st, "RUNNING")
+        ev = self.events()
+        self.assertIn("не найдена по метке", ev)
+        self.assertIn(str(self.wdir / wab.CONTINUE_FILE), ev)
+        self.assertIn(MARK, ev)
+        self.assertIn("без метки новая сессия не привяжется", ev)
+
+
 class TestCacheReseek(_Tmp):
     def test_two_same_size_rewrites_of_one_inode_both_detected(self):
         a, b, c3 = assistant(0, 0, 111), assistant(0, 0, 222), assistant(0, 0, 333)

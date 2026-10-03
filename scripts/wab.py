@@ -1087,6 +1087,34 @@ def _await_new_session(w, now):
     w["await_at"] = now
 
 
+CONTINUE_FILE = "continue-prompt.md"
+
+
+def continue_text(cfg, wave, wdir):
+    """Продолжение после /clear: начинается с метки волны, по ней находится новый журнал."""
+    return (f"{session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot после /clear. "
+            f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
+
+
+def write_continue_prompt(cfg, wave, wdir):
+    """Текст продолжения в файл волны: если сообщение не дошло, владелец отправит его в окно сам."""
+    path = wdir / CONTINUE_FILE
+    path.write_text(continue_text(cfg, wave, wdir) + "\n", encoding="utf-8")
+    return path
+
+
+def continue_hint(cfg, wave, wdir):
+    """Хвост события (собран диспетчером из своих значений, идёт как trusted)."""
+    return (f"; если продолжение не дошло — отправьте в окно текст из {wdir / CONTINUE_FILE} "
+            f"(он начинается с метки {session_marker(cfg, wave)}); без метки новая сессия не привяжется")
+
+
+def continue_status_note(cfg, wave):
+    """То же одной строкой для status (текст status вычищается при выводе: только имя файла)."""
+    return (f"; если продолжение не дошло, отправьте в окно текст из {CONTINUE_FILE} каталога волны "
+            f"(начинается с метки {session_marker(cfg, wave)}); без метки новая сессия не привяжется")
+
+
 def tick(cfg, st, waves_json=None):
     wave = st.get("current")
     if not wave:
@@ -1165,16 +1193,20 @@ def tick(cfg, st, waves_json=None):
         w["clear_at"] = now
         w["clear_sent"] = False
         _await_new_session(w, now)
+        write_continue_prompt(cfg, wave, wdir)  # до /clear: файл должен лежать, когда окно очищено
         save_state(cfg, st)
-    if w["phase"] in ("clearing", "resuming") and not w.get("await_session"):
-        # состояние от версии без флага: после /clear старый журнал мерить нельзя
-        _await_new_session(w, now)
+    if w["phase"] in ("clearing", "resuming") and (not w.get("await_session")
+                                                   or not (wdir / CONTINUE_FILE).exists()):
+        # состояние от версии без флага или файла: после /clear старый журнал мерить нельзя
+        if not w.get("await_session"):
+            _await_new_session(w, now)
+        write_continue_prompt(cfg, wave, wdir)
         save_state(cfg, st)
     if w["phase"] == "resuming":
         # диспетчер упал между сохранением и подтверждением доставки: продолжение могло дойти, а могло нет
         msg = ("BLOCKED: перезапуск диспетчера при отправке продолжения после /clear; проверьте окно: "
-               "продолжение могло не дойти")
-        event(cfg, f"{wave}: {msg}; {attach}")
+               "продолжение могло не дойти" + continue_status_note(cfg, wave))
+        event(cfg, f"{wave}: {msg}; {attach}", trusted=continue_hint(cfg, wave, wdir))
         w["phase"] = "not_ready"
         w["notified"]["blocked"] = msg
         (wdir / "status").write_text(msg + "\n", encoding="utf-8")
@@ -1202,8 +1234,9 @@ def tick(cfg, st, waves_json=None):
             return True
         if not any(m in txt for m in READY_MARKERS):
             if since > READY_AFTER_CLEAR_SECONDS:
-                msg = "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
-                event(cfg, f"{wave}: {msg}; {attach}")
+                msg = ("BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
+                       + continue_status_note(cfg, wave))
+                event(cfg, f"{wave}: {msg}; {attach}", trusted=continue_hint(cfg, wave, wdir))
                 w["phase"] = "not_ready"
                 w["notified"]["blocked"] = msg  # ветка BLOCKED на следующем тике не повторит событие
                 (wdir / "status").write_text(msg + "\n", encoding="utf-8")
@@ -1213,8 +1246,7 @@ def tick(cfg, st, waves_json=None):
         save_state(cfg, st)
         # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update;
         # метка волны в начале — по ней находится новый журнал сессии
-        send_text(name, f"{session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot после /clear. "
-                        f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
+        send_text(name, continue_text(cfg, wave, wdir))
         event(cfg, f"{wave}: handoff готов, /clear и продолжение (перезапуск №{w['restarts'] + 1})")
         w["restarts"] += 1
         w["phase"] = "running"
@@ -1248,8 +1280,11 @@ def tick(cfg, st, waves_json=None):
         else:
             started = w.setdefault("await_at", now)  # состояние без метки времени: срок идёт с этого тика
             if now - started > AWAIT_SESSION_MINUTES * 60 and once_per(w, "await_timeout", str(started)):
+                if not (wdir / CONTINUE_FILE).exists():
+                    write_continue_prompt(cfg, wave, wdir)
                 event(cfg, f"{wave}: новая сессия не найдена по метке за {AWAIT_SESSION_MINUTES} мин: "
-                           f"контекст не меряется, контрольная точка не запрашивается; {attach}")
+                           f"контекст не меряется, контрольная точка не запрашивается; {attach}",
+                      trusted=continue_hint(cfg, wave, wdir))
     if awaiting:
         tokens = w.get("tokens", 0)  # старый журнал не меряем: контрольную точку не запрашиваем
     else:
