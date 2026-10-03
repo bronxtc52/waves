@@ -54,6 +54,7 @@ wab.tmux_alive = tmux_alive
 wab.prepare_worktree = prepare_worktree
 wab.sh = sh
 wab.wait_ready = lambda *a, **k: True
+wab.ensure_roles = lambda cfg, refresh=False: (dict(cfg["roles"]), {})
 wab.send_text = lambda *a, **k: None
 (sig / (wave + ".started")).write_text("1")
 try:
@@ -153,6 +154,9 @@ class _Real(_Base):
     def setUp(self):
         super().setUp()
         self.calls = []
+        pt = helpers.stub_ensure_roles(wab)
+        pt.start()
+        self.addCleanup(pt.stop)
         for n, fn in {"tmux_alive": lambda *a, **k: False,
                       "sh": lambda *a, **k: self.calls.append("sh"),
                       "wait_ready": lambda *a, **k: True,
