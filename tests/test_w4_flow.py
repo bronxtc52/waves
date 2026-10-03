@@ -34,6 +34,7 @@ class Gh:
         self.draft = False
         self.runs = [{"name": "ci", "status": "completed", "conclusion": "success"}]
         self.oid, self.ancestor = MOID, 0
+        self.fetch_rc = 0
         self.merge_rc, self.merge_err = 0, ""
         self.on_merge = None
         self.dirty = ""
@@ -69,7 +70,7 @@ class Gh:
             if "status" in argv:
                 return 0, self.dirty, ""
             if "fetch" in argv:
-                return 0, "", ""
+                return self.fetch_rc, "", "fatal: unable to access" if self.fetch_rc else ""
             if "merge-base" in argv:
                 return self.ancestor, "", ""
         raise AssertionError(f"неожиданный вызов {argv}")
@@ -442,6 +443,63 @@ class TestMergedChecks(_Flow):
         saved = wab.load_state(self.cfg)
         self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
         self.assertEqual(saved["waves"]["W1"]["pr"]["sha"], OTHER)
+
+
+class TestMergeUnverifiedRegate(_Flow):
+    """merge_unverified каждый такт проходит гейт заново: CI финального HEAD мог перезапуститься."""
+
+    GREEN = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+
+    def run_watch(self):
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(wab.time, "sleep"):
+            wab._watch_loop(self.cfg, str(self.cfg_path))
+
+    def to_unverified(self):
+        self.gh.state, self.gh.runs, self.gh.fetch_rc = "MERGED", list(self.GREEN), 1
+        self.assertTrue(self.tick("DONE"))
+        self.assertEqual(self.w()["phase"], "merge_unverified")
+
+    def test_ci_turned_red_while_unverified_blocks(self):
+        self.to_unverified()
+        self.gh.runs = [{"name": "ci", "status": "completed", "conclusion": "failure"}]
+        self.gh.fetch_rc = 0
+        self.tick()
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: PR #7 смержен, но check-runs"), self.status())
+        self.m_launch.assert_not_called()
+        self.assertNotIn("pending_launch", self.st)
+        self.assertNotIn("merged", self.w())
+        self.assertEqual(self.gh.merges(), [])
+        self.assertEqual(self.keys, [])
+
+    def test_ci_pending_while_unverified_waits_then_launches_once(self):
+        self.to_unverified()
+        self.gh.runs = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        self.gh.fetch_rc = 0
+        self.assertTrue(self.tick())
+        self.assertEqual(self.w()["phase"], "merge_unverified")
+        self.assertEqual(self.w()["gate"]["verdict"], "wait")
+        self.assertNotIn("merged", self.w())
+        self.assertNotIn("pending_launch", self.st)
+        self.gh.runs = list(self.GREEN)
+        wab.save_state(self.cfg, self.st)
+        launched = []
+
+        def reserve(cfg, wave, prompt):
+            launched.append(wave)
+            with wab.run_lock(cfg):
+                st = wab.load_state(cfg)
+                st.pop("pending_launch", None)
+                st["current"] = wave
+                st["waves"][wave] = {"tmux": "wab-demo-w2", "cwd": None, "phase": "running",
+                                     "restarts": 0, "notified": {}, "started": 1.0}
+                wab.save_state(cfg, st)
+            self.alive = False
+            return True
+        self.m_launch.side_effect = reserve
+        self.run_watch()
+        self.assertEqual(launched, ["W2"])
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "merged")
+        self.assertEqual(self.gh.merges(), [])
 
 
 class TestMergeVerify(_Flow):

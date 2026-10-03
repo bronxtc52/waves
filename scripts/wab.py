@@ -1248,7 +1248,8 @@ def _pr_info(pr):
 def _gate_tick(cfg, st, wave, w, waves_json):
     """Такт гейта на DONE (фазы gate/awaiting_merge): факты → решение → ждать, BLOCKED, мердж или переход."""
     now = time.time()
-    if w.get("phase") not in GATE_PHASES:
+    unverified = w.get("phase") == "merge_unverified"   # wait держит эту фазу, а не возвращает в gate
+    if w.get("phase") not in GATE_PHASES and not unverified:
         w["phase"] = "gate"   # фаза — в state до любых действий
         w.pop("gate", None)
         w["notified"].pop("gate", None)
@@ -1262,6 +1263,10 @@ def _gate_tick(cfg, st, wave, w, waves_json):
         return _gate_wait(cfg, st, wave, w, reasons, pr, now)
     if verdict == "fail":
         return _gate_fail(cfg, st, wave, w, reasons, pr, now)
+    if unverified and verdict != "merged":
+        # PR снова не MERGED (pass): мерджа из этой фазы нет никогда — только ждать
+        return _gate_wait(cfg, st, wave, w, [f"PR #{(pr or {}).get('number')} больше не в состоянии MERGED"],
+                          pr, now)
     if verdict == "merged":
         oid = ((pr.get("mergeCommit") or {}).get("oid") or "")
         w["pr"] = _pr_info(pr)
@@ -1474,8 +1479,10 @@ def tick(cfg, st, waves_json=None):
     attach = f"tmux attach -t ={name}  (выйти: Ctrl-b d)"
 
     # merge-коммит уже есть, но его ещё не видно в origin/<base>: только повторная проверка
+    # merge_unverified проходит гейт заново (не _verify_merge напрямую): CI финального HEAD мог
+    # перезапуститься и стать pending/failure, пока merge-коммит догонял origin/<base>
     if w.get("phase") == "merge_unverified":
-        return _verify_merge(cfg, st, wave, w, waves_json)
+        return _gate_tick(cfg, st, wave, w, waves_json)
     # сначала DONE: волна могла закончиться и закрыть окно между двумя тиками. DONE — это «PR готов,
     # CI зелёный», а не «смержено»: дальше решает гейт мерджа (окно не закрывается до MERGED)
     if status == "DONE":
