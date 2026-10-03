@@ -354,6 +354,78 @@ class TestMigrateNoSessions(_TickBase):
         self.assertEqual(w["tokens"], 9)
 
 
+class TestAwaitBeatsMigration(_TickBase):
+    """Запись без sessions: ожидание новой сессии приоритетнее миграции, журнал находит find_new_session."""
+
+    def st(self, **extra):
+        st = super().st(**extra)
+        w = st["waves"]["W1"]
+        for k in ("sessions", "await_session", "tokens", "peak"):
+            w.pop(k, None)
+        return st
+
+    def tick_status(self, st, status):
+        (wab.wave_dir(self.cfg, "W1") / "status").write_text(status + "\n", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(wab.tick(self.cfg, st))
+        return st["waves"]["W1"]
+
+    def finish_clear(self, st, status):
+        """Довести clearing -> running (отправка /clear, пауза, готовое окно, продолжение)."""
+        w = st["waves"]["W1"]
+        for _ in range(6):
+            if w["phase"] == "running":
+                return w
+            if w.get("clear_at"):
+                w["clear_at"] -= 10000
+            w = self.tick_status(st, status)
+        self.assertEqual(w["phase"], "running")
+        return w
+
+    def assert_bound_and_checkpoint(self, st):
+        self.journal("new", [user(f"{MARK} продолжаем"), assistant(0, 0, self.cfg["ctx_limit"] + 9)], mtime=5000)
+        w = self.tick_status(st, "RUNNING")
+        self.assertEqual(w["sessions"], ["new"])
+        self.assertFalse(w["await_session"])
+        self.assertIn("новая сессия привязана по метке", self.events())
+        self.assertNotIn("запись без sessions", self.events())
+        w = self.tick_status(st, "RUNNING")
+        self.assertEqual(w["phase"], "checkpoint")
+        self.assertTrue(any("WAB-CHECKPOINT" in a[1] for a in self.sent), self.sent)
+
+    def test_checkpoint_handoff_ready_then_new_journal(self):
+        st = self.st(phase="checkpoint")
+        w = self.tick_status(st, "HANDOFF_READY")
+        self.assertTrue(w["await_session"])
+        self.assertNotIn("sessions", w)
+        self.finish_clear(st, "HANDOFF_READY")
+        self.assertTrue(st["waves"]["W1"]["await_session"])
+        self.assert_bound_and_checkpoint(st)
+
+    def test_clearing_after_watch_restart(self):
+        st = self.st(phase="clearing", clear_sent=True, clear_at=time.time() - 10000)
+        self.finish_clear(st, "RUNNING")
+        self.assert_bound_and_checkpoint(st)
+
+    def test_resuming_after_watch_restart(self):
+        st = self.st(phase="resuming")
+        w = self.tick_status(st, "RUNNING")   # перезапуск на resuming: BLOCKED, not_ready, ожидание остаётся
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertTrue(w["await_session"])
+        self.assertNotIn("sessions", w)
+        self.journal("fresh", [user(f"{MARK} продолжаем"), assistant(0, 0, 3)], mtime=5000)
+        w = self.tick_status(st, "RUNNING")
+        self.assertEqual(w["sessions"], ["fresh"])
+        self.assertFalse(w["await_session"])
+        self.assertNotIn("запись без sessions", self.events())
+
+    def test_migration_without_await_still_works(self):
+        self.journal("fresh", [assistant(0, 0, 11)], mtime=5000)
+        w = self.tick_status(self.st(), "RUNNING")
+        self.assertEqual((w["sessions"], w["tokens"]), (["fresh"], 11))
+        self.assertIn("запись без sessions (до W3): привязан журнал fresh как текущий", self.events())
+
+
 class TestLaunchSession(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

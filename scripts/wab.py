@@ -1297,9 +1297,11 @@ def tick(cfg, st, waves_json=None):
         event(cfg, f"{wave}: восстановлена вручную, слежу дальше")
         save_state(cfg, st)
 
-    if "sessions" not in w and w.get("cwd"):
+    if "sessions" not in w and w.get("cwd") and not w.get("await_session"):
         # запись, созданная до W3 (watch перезапущен на идущей волне): без sessions контекст не мерился бы
         # никогда. Привязываем самый свежий журнал, которым не владеет ни одна волна, и сохраняем до действий.
+        # Пока стоит await_session, новый журнал привязывает только find_new_session (по метке, со снятием
+        # флага): миграция забрала бы его в sessions, и флаг остался бы навсегда.
         sid = freshest_unowned_session(st, wave)
         if sid:
             w["sessions"] = [sid]
