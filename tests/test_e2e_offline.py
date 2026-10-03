@@ -366,7 +366,8 @@ class _E2E(unittest.TestCase):
         self.assertTrue(log[0].endswith("(#2)") and log[1].endswith("(#1)"), log)
         main_hello = _git("--git-dir", str(self.origin), "show", "main:hello.py", env=self.env)
         self.assertEqual(main_hello + "\n", HELLO2)
-        self.assertFalse(self.alive("W1") or self.alive("W2"), "окна волн должны быть закрыты")
+        # _verify_merge шлёт /exit без подтверждения: окно последней волны закрывается чуть позже выхода watch
+        self.wait_for(lambda: not (self.alive("W1") or self.alive("W2")), "закрытие окон волн", watch_may_exit=True)
         self.assertEqual(self.errors(), "")
         # журналы сессий легли во временный HOME, а не в настоящий
         for wid in ("W1", "W2"):
