@@ -248,3 +248,38 @@ class TestPlanFifo(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPreClearSnapshot(TestAwaitInvariant):
+    """Журнал, лежавший до /clear (непривязанный, с меткой прошлой попытки), не снимает ожидание."""
+
+    def test_unbound_marked_journal_before_clear_is_not_new_session(self):
+        self.journal("j1", clear_scaffold() + [user(f"{MARK} продолжаем"), assistant(0, 0, 10)], mtime=1500)
+        st = self.st("checkpoint", checkpoint_sent=True)
+        self.tick(st, "HANDOFF_READY")                    # checkpoint -> clearing, снимок
+        st["waves"]["W1"]["clear_at"] = time.time() - wab.CLEAR_SETTLE_SECONDS - 5
+        self.tick(st, "HANDOFF_READY")                    # clearing -> resuming -> running
+        self.tick(st, "RUNNING")                          # ожидание новой сессии
+        w = st["waves"]["W1"]
+        self.assertTrue(w["await_session"])
+        self.assertEqual(w["sessions"], ["old"])
+        self.assertEqual(w["pre_clear"], ["j1", "old"])
+        self.journal("new", clear_scaffold() + [user(f"{MARK} продолжаем"), assistant(0, 0, 50)], mtime=2000)
+        self.tick(st, "RUNNING")
+        w = st["waves"]["W1"]
+        self.assertEqual((w["sessions"], w["await_session"], w["tokens"]), (["old", "new"], False, 50))
+        self.assertNotIn("pre_clear", w)
+
+    def test_snapshot_on_disk_before_clear_is_sent(self):
+        seen = []
+        wab.send_command.side_effect = lambda *a, **k: seen.append(
+            wab.load_state(self.cfg)["waves"]["W1"].get("pre_clear"))
+        self.tick(self.st("checkpoint", checkpoint_sent=True), "HANDOFF_READY")
+        self.assertEqual(seen, [["old"]])
+
+    def test_record_without_pre_clear_still_binds_marked_journal(self):
+        self.journal("new", clear_scaffold() + [user(f"{MARK} продолжаем"), assistant(0, 0, 50)], mtime=2000)
+        st = self.st("running", await_session=True)
+        w = self.tick(st, "RUNNING")
+        self.assertNotIn("pre_clear", w)
+        self.assertEqual((w["sessions"], w["await_session"]), (["old", "new"], False))

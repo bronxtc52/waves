@@ -455,10 +455,18 @@ def freshest_unowned_session(st, wave):
     return max(files)[1] if files else None
 
 
+def snapshot_transcripts(cwd):
+    """Отсортированные stem всех журналов каталога рабочей копии: снимок до /clear. Журнал, уже лежавший
+    тогда (например, непривязанный журнал прошлой попытки с той же меткой), новой сессией не считается."""
+    d = transcript_dir(cwd)
+    return sorted(f.stem for f in d.glob("*.jsonl")) if d.exists() else []
+
+
 def find_new_session(cfg, st, wave):
     """После /clear волна продолжается в новом файле журнала. Ищем его по метке в первом настоящем
     сообщении среди журналов этой рабочей копии, которых ещё нет ни у одной волны; свежие первыми."""
     owned = owned_sessions(st)
+    owned.update(st["waves"][wave].get("pre_clear") or [])  # нет ключа (старая запись) — как раньше
     d = transcript_dir(st["waves"][wave]["cwd"])
     if not d.exists():
         return None
@@ -1268,6 +1276,7 @@ def tick(cfg, st, waves_json=None):
         w["clear_at"] = now
         w["clear_sent"] = False
         _await_new_session(w, now)
+        w["pre_clear"] = snapshot_transcripts(w["cwd"])  # до save_state и /clear
         write_continue_prompt(cfg, wave, wdir)  # до /clear: файл должен лежать, когда окно очищено
         save_state(cfg, st)
     if w["phase"] in ("clearing", "resuming") and (not w.get("await_session")
@@ -1367,6 +1376,7 @@ def tick(cfg, st, waves_json=None):
             w.setdefault("sessions", []).append(sid)
             w["await_session"] = awaiting = False
             w.pop("await_at", None)
+            w.pop("pre_clear", None)
             event(cfg, f"{wave}: новая сессия привязана по метке")
             save_state(cfg, st)
         else:
