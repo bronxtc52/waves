@@ -26,12 +26,12 @@ import os
 import pathlib
 import re
 import shlex
-import stat
 import subprocess
 import sys
 import time
 import uuid
 
+import gate
 import waves_config
 from waves_config import ConfigError, load_waves
 
@@ -54,7 +54,7 @@ TAIL_BYTES = 4_000_000         # контекст меряется по посл
 FIRST_MESSAGE_BYTES = 256 * 1024
 HEAD_BYTES = 4096              # проверка подлинности журнала: хеш первых 4 КБ
 READ_CHUNK = 1 << 20
-PLAN_MAX_BYTES = 1024 * 1024   # waves.md крупнее мегабайта — не план
+PLAN_MAX_BYTES = gate.PLAN_MAX_BYTES  # waves.md крупнее мегабайта — не план (чтение плана — gate.plan_issue)
 
 
 # ---------- конфиг и состояние ----------
@@ -841,32 +841,11 @@ def check_plan(cfg):
               file=sys.stderr)
         return
     path = cfg["plan_path"]
-
-    def refuse(why, short=None):
+    issue = gate.plan_issue(cfg)
+    if issue:
+        why, short = issue
         event(cfg, f"BLOCKED: plan changed since approval: {short or why}", trusted=f" (файл {path})")
         raise SystemExit(f"BLOCKED: plan changed since approval: {why} (файл {path})")
-
-    try:
-        # O_NONBLOCK: FIFO без писателя вечно ждёт при открытии; тип проверяется по fstat ниже
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    except FileNotFoundError:
-        refuse("файла waves.md нет")
-    except OSError as e:
-        refuse(f"waves.md не открыт (симлинк или нет доступа): {e.strerror or e}")
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            refuse("waves.md не обычный файл")
-        with os.fdopen(fd, "rb", closefd=False) as f:
-            data = f.read(PLAN_MAX_BYTES + 1)
-    finally:
-        os.close(fd)
-    if len(data) > PLAN_MAX_BYTES:
-        refuse(f"waves.md больше {PLAN_MAX_BYTES // (1024 * 1024)} МБ")
-    got = hashlib.sha256(data).hexdigest()
-    if got != want:
-        refuse(f"sha256 waves.md не совпадает с plan_sha256 (в конфиге {want[:12]}…, в файле {got[:12]}…)",
-               short="sha256 waves.md не совпадает с plan_sha256")
-
 
 def launch(cfg, wave, prompt_file):
     """Запустить одну волну. False, если окно Claude не стало готовым: тогда ничего не отправляем."""
