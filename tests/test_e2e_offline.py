@@ -196,14 +196,16 @@ class _E2E(unittest.TestCase):
         seed = self.tmp / "seed"
         _git("init", "-q", "-b", "main", str(seed), env=self.env)
         (seed / "README.md").write_text("demo\n", encoding="utf-8")
-        _git("add", "README.md", cwd=seed, env=self.env)
+        (seed / ".gitignore").write_text("runs/\n", encoding="utf-8")   # как велит быстрый старт README
+        _git("add", "README.md", ".gitignore", cwd=seed, env=self.env)
         _git("commit", "-q", "-m", "init", cwd=seed, env=self.env)
         _git("push", "-q", str(self.origin), "main", cwd=seed, env=self.env)
         _git("clone", "-q", str(self.origin), str(self.checkout), env=self.env)
 
     def _plan(self):
-        self.plan_dir = self.tmp / "plan"
-        self.plan_dir.mkdir()
+        # как в быстром старте README: waves.md, waves.json и prompt-W1.md — в корне рабочей копии,
+        # runs/ (состояние и worktree волн) — там же, в .gitignore
+        self.plan_dir = self.checkout
         (self.plan_dir / "waves.md").write_text(PLAN, encoding="utf-8")
         cfg = {
             "chain": CHAIN, "run_id": RUN_ID, "repo": REPO, "checkout": str(self.checkout),
@@ -448,7 +450,7 @@ class TestChainHumanMerge(_E2E):
         self.assertEqual(self.actions("W1").count("commit:part1.txt"), 1)
         self.assertEqual(self.actions("W1").count("commit:hello.py"), 1)
         files = _git("--git-dir", str(self.origin), "ls-tree", "--name-only", "main", env=self.env).split()
-        self.assertEqual(sorted(files), ["README.md", "hello.py", "part1.txt"])
+        self.assertEqual(sorted(files), [".gitignore", "README.md", "hello.py", "part1.txt"])
         self.assertIn("Перезапуски после /clear: 1", chain)
         self.assertIn("BLOCKED: Какой вариант выбрать", chain)
 
