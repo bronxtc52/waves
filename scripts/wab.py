@@ -427,6 +427,21 @@ def _first_user_text(path):
     return ""
 
 
+_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+
+
+def starts_with_marker(text, marker):
+    """Метка стоит В НАЧАЛЕ первого настоящего сообщения (после lstrip) или, если продолжение отправлено
+    slash-командой, в начале <command-args>. Подстрока не годится: чужой журнал мог лишь цитировать метку."""
+    t = text.lstrip()
+    if t.startswith(marker):
+        return True
+    if t.startswith("<command-"):
+        m = _COMMAND_ARGS.search(t)
+        return bool(m) and m.group(1).lstrip().startswith(marker)
+    return False
+
+
 def owned_sessions(st):
     """Все id сессий, уже принадлежащих какой-либо волне: текущие И прежних попыток
     (перезапущенная волна оставляет старые журналы, а в них та же метка)."""
@@ -480,7 +495,7 @@ def find_new_session(cfg, st, wave):
     for _, f in sorted(files, key=lambda t: t[0], reverse=True):
         if f.stem in owned:
             continue
-        if marker in _first_user_text(f):
+        if starts_with_marker(_first_user_text(f), marker):
             return f.stem
     return None
 
@@ -1287,7 +1302,22 @@ def tick(cfg, st, waves_json=None):
         write_continue_prompt(cfg, wave, wdir)
         save_state(cfg, st)
     if w["phase"] == "resuming":
-        # диспетчер упал между сохранением и подтверждением доставки: продолжение могло дойти, а могло нет
+        # диспетчер упал между сохранением и подтверждением доставки: продолжение могло дойти, а могло нет.
+        # Журнал с меткой, которого не было до /clear (pre_clear), — доставлено: статус агента не трогаем
+        sid = find_new_session(cfg, st, wave) if w.get("await_session") else None
+        if sid:
+            w.setdefault("sessions", []).append(sid)
+            w["await_session"] = False
+            w.pop("await_at", None)
+            w.pop("pre_clear", None)
+            w["phase"] = "running"
+            w["restarts"] += 1
+            w["checkpoint_at"] = None
+            w.pop("clear_at", None)
+            w.pop("clear_sent", None)
+            event(cfg, f"{wave}: продолжение после /clear доставлено (подтверждено журналом после перезапуска диспетчера)")
+            save_state(cfg, st)
+            return True
         msg = ("BLOCKED: перезапуск диспетчера при отправке продолжения после /clear; проверьте окно: "
                "продолжение могло не дойти" + continue_status_note(cfg, wave))
         event(cfg, f"{wave}: {msg}; {attach}", trusted=continue_hint(cfg, wave, wdir))

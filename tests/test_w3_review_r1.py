@@ -283,3 +283,48 @@ class TestPreClearSnapshot(TestAwaitInvariant):
         w = self.tick(st, "RUNNING")
         self.assertNotIn("pre_clear", w)
         self.assertEqual((w["sessions"], w["await_session"]), (["old", "new"], False))
+
+
+class TestMarkerAtStart(TestAwaitInvariant):
+    """Привязка только по метке в начале первого сообщения (или <command-args>); цитата в середине — нет."""
+
+    def bound(self, first_text):
+        self.journal("new", [user(first_text), assistant(0, 0, 50)], mtime=2000)
+        return wab.find_new_session(self.cfg, self.st("running", await_session=True), "W1")
+
+    def test_quoted_marker_in_middle_not_bound(self):
+        self.assertIsNone(self.bound(f"прочитай continue-prompt.md: {MARK} продолжаем"))
+
+    def test_marker_at_start_bound(self):
+        self.assertEqual(self.bound(f"  {MARK} продолжаем"), "new")
+
+    def test_slash_command_marker_at_start_of_args_bound(self):
+        t = ("<command-message>update</command-message>\n<command-name>/update</command-name>\n"
+             f"<command-args>  {MARK} продолжаем</command-args>")
+        self.assertEqual(self.bound(t), "new")
+
+    def test_slash_command_marker_not_at_start_of_args_not_bound(self):
+        t = ("<command-message>update</command-message>\n<command-name>/update</command-name>\n"
+             f"<command-args>см. {MARK} продолжаем</command-args>")
+        self.assertIsNone(self.bound(t))
+
+
+class TestResumingConfirmedByJournal(TestAwaitInvariant):
+    def resuming(self):
+        return self.st("resuming", clear_sent=True, clear_at=1.0, await_session=True, pre_clear=["old"])
+
+    def test_delivered_continue_found_in_journal_goes_running(self):
+        self.journal("new", [user(f"{MARK} продолжаем"), assistant(0, 0, 50)], mtime=2000)
+        st = self.resuming()
+        w = self.tick(st, "RUNNING")
+        self.assertEqual((w["phase"], w["sessions"], w["await_session"], w["restarts"]),
+                         ("running", ["old", "new"], False, 2))
+        self.assertNotIn("pre_clear", w)
+        self.assertNotIn("clear_at", w)
+        self.assertEqual((self.wdir / "status").read_text(encoding="utf-8").strip(), "RUNNING")
+        self.assertIn("доставлено (подтверждено журналом", (self.cfg["run_dir"] / "events.log").read_text(encoding="utf-8"))
+
+    def test_resuming_without_journal_still_blocked(self):
+        w = self.tick(self.resuming(), "RUNNING")
+        self.assertEqual(w["phase"], "not_ready")
+        self.assertTrue((self.wdir / "status").read_text(encoding="utf-8").startswith("BLOCKED"))
