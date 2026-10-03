@@ -1,5 +1,6 @@
 """tick() при DONE и вычистка секретов в event(): без tmux, всё внешнее подменено."""
 import contextlib
+import hashlib
 import io
 import os
 import pathlib
@@ -16,6 +17,14 @@ from test_w4_flow import Gh
 
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # 36 символов после префикса
 MAIL = "someone.person@example.org"
+
+
+def pinned_good(directory):
+    """Хороший конфиг с пином плана и сам waves.md рядом (автозапуск следующей волны требует пина)."""
+    d = good()
+    d["plan_sha256"] = hashlib.sha256(b"plan\n").hexdigest()
+    (pathlib.Path(directory) / "waves.md").write_bytes(b"plan\n")
+    return d
 
 
 class _Base(unittest.TestCase):
@@ -38,6 +47,9 @@ class TestDone(_Base):
 
     def setUp(self):
         super().setUp()
+        # автозапуск следующей волны (pending_launch) — только с пином плана
+        self.cfg_path = write_json(self.dir, pinned_good(self.dir))
+        self.cfg = wab.load_waves(str(self.cfg_path))
         self.sent = []
         self.gh = Gh(self)
         self.gh.state = "MERGED"
@@ -118,7 +130,7 @@ class TestDone(_Base):
         # пробел, апостроф, кириллица и длинный сегмент без дефисов (похож на «непрозрачную строку»)
         deep = self.dir / where / ("verylongprojectname" * 3)
         deep.mkdir(parents=True)
-        self.cfg_path = write_json(deep, good())
+        self.cfg_path = write_json(deep, pinned_good(deep))
         self.cfg = wab.load_waves(str(self.cfg_path))
         wdir = self.finish("W1")
         st = self.state("W1")
@@ -142,7 +154,7 @@ class TestDone(_Base):
         # перевод строки в пути: после склейки в одну строку команда указала бы на другой путь
         deep = self.dir / where
         deep.mkdir(parents=True)
-        self.cfg_path = write_json(deep, good())
+        self.cfg_path = write_json(deep, pinned_good(deep))
         self.cfg = wab.load_waves(str(self.cfg_path))
         self.finish("W1")
         st = self.state("W1")
@@ -188,7 +200,7 @@ class TestDone(_Base):
         # относительный путь с длинным сегментом без дефисов: раньше становился «[скрыто].json»
         seg = "L" * 60
         (self.dir / seg).mkdir()
-        rel_target = write_json(self.dir / seg, good())
+        rel_target = write_json(self.dir / seg, pinned_good(self.dir / seg))
         cwd = os.getcwd()
         os.chdir(self.dir)
         self.addCleanup(os.chdir, cwd)

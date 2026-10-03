@@ -67,9 +67,10 @@ WAB="${WAB:-$HOME/.claude/skills/wave-autobot}"
 `BLOCKED: merge gate: <причина>` в `status` и та же причина в окно волны (волна исправляет и снова
 пишет `DONE`); изменённый план — `BLOCKED: plan changed since approval`. Пройден: при
 `automerge: false` (по умолчанию) волна ждёт, пока PR смержит человек; при `automerge: true`
-диспетчер сам делает один `gh pr merge --squash --match-head-commit <sha>`. После MERGED и проверки,
-что merge-коммит есть в `origin/<base_branch>`, окно закрывается и диспетчер **сам запускает**
-следующую волну по её `next-prompt.md`. Итог цепочки — `chain-result.md` в каталоге прогона.
+диспетчер сам делает один `gh pr merge --squash --match-head-commit <sha>` (`automerge: true` требует
+`plan_sha256`). После MERGED и проверки, что merge-коммит есть в `origin/<base_branch>`, окно
+закрывается и диспетчер **сам запускает** следующую волну по её `next-prompt.md` — только при заданном
+`plan_sha256`; без пина он печатает команду `launch`, и следующую волну запускают вручную. Итог цепочки — `chain-result.md` в каталоге прогона.
 Человек видит дашборд (волны, контекст, события, роли и fallback) и подключается к окну волны
 через `tmux attach`, когда волна пишет `BLOCKED`.
 Вычистка секретов из событий и дашборда (`redact`) работает шаблонами: известные формы ключей, токенов,

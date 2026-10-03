@@ -78,6 +78,7 @@ class Gh:
 
 class _Flow(unittest.TestCase):
     automerge = False
+    pinned = True
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -85,6 +86,9 @@ class _Flow(unittest.TestCase):
         self.dir = pathlib.Path(self._tmp.name)
         self.data = good()
         self.data["automerge"] = self.automerge
+        if self.pinned:   # automerge и автозапуск следующей волны требуют пина плана
+            self.data["plan_sha256"] = hashlib.sha256(b"plan v1\n").hexdigest()
+            (self.dir / "waves.md").write_bytes(b"plan v1\n")
         self.load()
         self.gh = Gh(self)
         self.texts, self.keys = [], []
@@ -536,6 +540,31 @@ class TestMergeUnverifiedRegate(_Flow):
         self.assertEqual(launched, ["W2"])
         self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "merged")
         self.assertEqual(self.gh.merges(), [])
+
+
+class TestNoPinNoAutolaunch(_Flow):
+    """Без plan_sha256 следующая волна сама не стартует: только подсказка с командой launch."""
+    pinned = False
+
+    def test_merged_without_pin_stops_with_hint(self):
+        self.assertIsNone(self.cfg["plan_sha256"])
+        self.gh.state = "MERGED"
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text("DONE\n", encoding="utf-8")
+        (wdir / "next-prompt.md").write_text("дальше\n", encoding="utf-8")
+        wab.save_state(self.cfg, self.st)
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(wab.time, "sleep"):
+            wab._watch_loop(self.cfg, str(self.cfg_path))
+        self.m_launch.assert_not_called()
+        saved = wab.load_state(self.cfg)
+        self.assertNotIn("pending_launch", saved)
+        self.assertIsNone(saved["current"])
+        self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
+        log = self.log()
+        self.assertIn("W1 смержена; нет plan_sha256 — следующую волну W2 запустите вручную", log)
+        self.assertIn(f"wab.py launch {self.cfg_path} W2 {wdir / 'next-prompt.md'}", log)
+        self.assertIn("watch остановлен", log)
+        self.assertIn(("wab-demo-w1", "-l", "/exit"), self.keys)
 
 
 class TestMergeVerify(_Flow):

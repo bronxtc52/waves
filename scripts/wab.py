@@ -1379,7 +1379,9 @@ def _verify_merge(cfg, st, wave, w, waves_json):
     idx = ids.index(wave)
     nxt = wave_path(cfg, wave) / "next-prompt.md"
     last, has_next = idx + 1 >= len(ids), nxt.exists()
-    if not last and has_next:
+    # без пина плана автозапуск следующей волны запрещён: launch без plan_sha256 не сверяет waves.md
+    pinned = bool(cfg.get("plan_sha256"))
+    if not last and has_next and pinned:
         st["pending_launch"] = {"wave": ids[idx + 1], "prompt": str(nxt), "after": wave}
     else:
         write_chain_result(cfg, st)   # до сохранения: остановка между ними не теряет итог (повтор перепишет)
@@ -1398,22 +1400,30 @@ def _verify_merge(cfg, st, wave, w, waves_json):
     if not has_next:
         event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
         return False
+    if not pinned:
+        _manual_launch_hint(cfg, f"{wave} смержена; нет plan_sha256 — следующую волну {ids[idx + 1]} "
+                                 f"запустите вручную.", ids[idx + 1], nxt, waves_json)
+        return False
     return _announce_next(cfg, wave, ids[idx + 1], nxt, waves_json)
 
 
-def _announce_next(cfg, wave, nxt_wave, nxt, waves_json):
-    """Событие об автозапуске следующей волны (pending_launch уже сохранён) с ручной командой."""
-    # ручная команда — на случай, если автозапуск откажет; собрана из путей диспетчера (не вычищается)
+def _manual_launch_hint(cfg, text, nxt_wave, nxt, waves_json):
+    """Событие `text` с командой ручного launch; команда собрана из путей диспетчера (не вычищается)."""
     args = [waves_json or "", nxt_wave, str(nxt)]
     if any(_has_line_break(a) for a in args):
         # event() склеивает строки trusted в одну: команда указала бы на другой путь
-        event(cfg, f"{wave}: смержена; следующая волна {nxt_wave} стартует автоматически. Путь содержит "
-                   f"перевод строки — команду ручного запуска не печатаю.")
+        event(cfg, f"{text} Путь содержит перевод строки — команду ручного запуска не печатаю.")
     else:
         target = shlex.quote(waves_json) if waves_json else "<waves.json>"
         cmd = " ".join(["wab.py", "launch", target, shlex.quote(nxt_wave), shlex.quote(str(nxt))])
-        event(cfg, f"{wave}: смержена; следующая волна {nxt_wave} стартует автоматически.",
-              trusted=" Следующая волна: " + cmd)
+        event(cfg, text, trusted=" Следующая волна: " + cmd)
+
+
+def _announce_next(cfg, wave, nxt_wave, nxt, waves_json):
+    """Событие об автозапуске следующей волны (pending_launch уже сохранён) с ручной командой
+    на случай, если автозапуск откажет."""
+    _manual_launch_hint(cfg, f"{wave}: смержена; следующая волна {nxt_wave} стартует автоматически.",
+                        nxt_wave, nxt, waves_json)
     return True
 
 
