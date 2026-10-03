@@ -40,6 +40,19 @@ class TestExamples(unittest.TestCase):
             self.assertIn(f"## Волна {w['id']} — ", plan)
         self.assertTrue((EX / "prompt-W1.md").read_text(encoding="utf-8").strip())
 
+    def test_prompt_relies_on_wave_context_not_plan_files(self):
+        """Волна идёт в worktree от origin/<base>: незакоммиченных waves.md/waves.json там нет."""
+        prompt = (EX / "prompt-W1.md").read_text(encoding="utf-8")
+        self.assertIn("Контекст волны", prompt)
+        self.assertNotIn("waves.md", prompt)
+        self.assertNotIn("waves.json", prompt)
+        # раздел, на который ссылается промпт, действительно есть в системной инструкции волны
+        import wab
+        cfg = waves_config.load_waves(EX / "waves.json")
+        text = wab.system_prompt_text(cfg, cfg["waves"][0], "/wdir", "/cwd", cfg["roles"])
+        self.assertIn("## Контекст волны", text)
+        self.assertIn(cfg["waves"][0]["check"], text)
+
 
 class TestReadme(unittest.TestCase):
     def test_warning_on_top(self):
@@ -64,6 +77,17 @@ class TestReadme(unittest.TestCase):
         self.assertIn("keys.tmux", README)
         self.assertTrue((ROOT / "keys.tmux").is_file())
         self.assertTrue((ROOT / "scripts" / "wab-open").is_file())
+
+    def test_every_wab_block_sets_wab(self):
+        """Новая сессия и окно tmux не наследуют переменную оболочки: каждый блок с "$WAB" задаёт её сам."""
+        blocks = re.findall(r"```[a-z]*\n(.*?)```", README, re.S)
+        using = [b for b in blocks if '"$WAB"' in b]
+        self.assertGreaterEqual(len(using), 4)
+        for b in using:
+            first = b.index('"$WAB"')
+            self.assertIn('WAB="$HOME/.claude/skills/wave-autobot"\n', b[:first], b)
+        self.assertIn("worktree", README)
+        self.assertRegex(README, r"prompt-W1\.md` лежат только в основной\s+рабочей копии")
 
     def test_fields_table_matches_config(self):
         rows = {m.group(1): line for line in README.splitlines()

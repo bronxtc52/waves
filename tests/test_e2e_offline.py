@@ -222,7 +222,7 @@ class _E2E(unittest.TestCase):
         self.waves_json = self.plan_dir / "waves.json"
         self.waves_json.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
         self.run_dir = self.plan_dir / "runs" / RUN_ID
-        (self.plan_dir / "prompt-W1.md").write_text("Сделай волну W1 по плану waves.md.\n", encoding="utf-8")
+        (self.plan_dir / "prompt-W1.md").write_text("Сделай волну W1 по разделу «Контекст волны» системной инструкции.\n", encoding="utf-8")
 
     def _teardown_procs(self):
         for p in self.procs:

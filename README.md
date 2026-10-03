@@ -86,22 +86,23 @@ tmux set -g @wab_open "$HOME/.claude/skills/wave-autobot/scripts/wab-open /пу�
 ## Быстрый старт за 5 шагов
 
 Пример — игрушечная цепочка из двух волн в [`examples/`](examples/): W1 добавляет `hello.py` с
-тестом, W2 — флаг `--name`. Все команды ниже берут скрипты из каталога скилла:
-
-```sh
-WAB="$HOME/.claude/skills/wave-autobot"
-```
+тестом, W2 — флаг `--name`. Команды берут скрипты из каталога скилла через переменную `WAB`; она
+задаётся в начале каждого блока, потому что новая сессия и новое окно tmux её не наследуют.
 
 **1. Скопируйте пример в свой репозиторий** (корень его рабочей копии, ветка `main`):
 
 ```sh
+WAB="$HOME/.claude/skills/wave-autobot"
 cd /путь/к/вашему/репозиторию
 cp "$WAB"/examples/waves.md "$WAB"/examples/waves.json "$WAB"/examples/prompt-W1.md .
 echo 'runs/' >> .gitignore
 ```
 
 В `runs/<run_id>/` рядом с `waves.json` диспетчер держит состояние, журнал событий и рабочие копии
-волн — в git им не место.
+волн — в git им не место. Сами `waves.md`, `waves.json` и `prompt-W1.md` лежат только в основной
+рабочей копии: волна работает в своём `git worktree` от `origin/<base_branch>` и этих файлов не видит.
+Цель, «Готово, когда» и команду проверки волна получает в системной инструкции (раздел «Контекст
+волны»), поэтому промпт волны ссылается на него, а не на файлы плана.
 
 **2. Поправьте `waves.json`:** `repo` — ваш `owner/name` на GitHub, `checkout` — абсолютный путь к
 корню рабочей копии (вывод `pwd`), `run_id` — имя прогона (например, сегодняшняя дата). Если
@@ -117,6 +118,7 @@ python3 -c 'import hashlib, json; c = json.load(open("waves.json")); c["plan_sha
 **3. Проверьте конфиг и модели:**
 
 ```sh
+WAB="$HOME/.claude/skills/wave-autobot"
 python3 "$WAB"/scripts/wab.py validate waves.json
 python3 "$WAB"/scripts/wab.py models waves.json
 ```
@@ -125,6 +127,13 @@ python3 "$WAB"/scripts/wab.py models waves.json
 
 ```sh
 tmux new -s wab
+```
+
+и уже в окне tmux:
+
+```sh
+WAB="$HOME/.claude/skills/wave-autobot"
+cd /путь/к/вашему/репозиторию
 python3 "$WAB"/scripts/wab.py launch waves.json W1 prompt-W1.md
 python3 "$WAB"/scripts/wab.py watch waves.json
 ```
@@ -132,6 +141,8 @@ python3 "$WAB"/scripts/wab.py watch waves.json
 **5. Откройте дашборд** в соседнем окне tmux (`Ctrl-b c`) и следите:
 
 ```sh
+WAB="$HOME/.claude/skills/wave-autobot"
+cd /путь/к/вашему/репозиторию
 python3 "$WAB"/scripts/dash.py waves.json
 ```
 
