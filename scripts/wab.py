@@ -319,6 +319,12 @@ class TranscriptCache:
                     f.seek(0)
                     if hashlib.sha1(f.read(length)).hexdigest() != digest:
                         e = self.entries[path] = self._blank(key)
+                    elif length < HEAD_BYTES and stt.st_size > length:
+                        # прежний префикс совпал, файл вырос: расширяем проверяемое начало, иначе
+                        # пустой или короткий первый снимок навсегда сравнивал бы пустую строку
+                        f.seek(0)
+                        head = f.read(min(HEAD_BYTES, stt.st_size))
+                        e["head"] = (len(head), hashlib.sha1(head).hexdigest())
                 if e["offset"] is None:
                     f.seek(0)  # после сверки хеша позиция не в начале: иначе в head попадает середина файла
                     head = f.read(min(HEAD_BYTES, stt.st_size))

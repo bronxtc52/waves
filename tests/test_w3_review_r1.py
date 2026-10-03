@@ -192,6 +192,45 @@ class TestCacheReseek(_Tmp):
         self.assertEqual(cache.bytes_read, before)
 
 
+class TestCacheHeadGrowth(_Tmp):
+    """Проверяемое начало растёт вместе с файлом: пустой или короткий первый снимок не слепит проверку."""
+
+    def _rewrite_same_size(self, first_bytes):
+        a, b = assistant(0, 0, 111), assistant(0, 0, 222)
+        self.assertEqual(len(a), len(b))
+        p = self.tdir / "s.jsonl"
+        p.write_bytes(b"x" * (first_bytes - 1) + b"\n" if first_bytes else b"")
+        cache = wab.TranscriptCache()
+        self.assertEqual(cache.read(p)["ctx"], 0)
+        with open(p, "ab") as f:
+            f.write((a + "\n").encode())
+        self.assertEqual(cache.read(p)["ctx"], 111)
+        ino, size = p.stat().st_ino, p.stat().st_size
+        with open(p, "r+b") as f:
+            f.seek(first_bytes)
+            f.write((b + "\n").encode())
+        self.assertEqual((p.stat().st_ino, p.stat().st_size), (ino, size))
+        self.assertEqual(cache.read(p)["ctx"], 222)
+
+    def test_rewrite_after_empty_first_read_detected(self):
+        self._rewrite_same_size(0)
+
+    def test_rewrite_after_100_byte_first_read_detected(self):
+        self._rewrite_same_size(100)
+
+    def test_unchanged_file_after_head_extension_is_not_reread(self):
+        p = self.tdir / "s.jsonl"
+        p.write_bytes(b"")
+        cache = wab.TranscriptCache()
+        cache.read(p)
+        with open(p, "ab") as f:
+            f.write((assistant(0, 0, 111) + "\n").encode())
+        self.assertEqual(cache.read(p)["ctx"], 111)
+        before = cache.bytes_read
+        self.assertEqual(cache.read(p)["ctx"], 111)
+        self.assertEqual(cache.bytes_read, before)
+
+
 class TestPlanFifo(unittest.TestCase):
     def test_fifo_in_place_of_plan_is_refused_not_hung(self):
         if not hasattr(os, "mkfifo"):
