@@ -297,16 +297,52 @@ class TestAutomerge(_Flow):
                 (self.dir / "waves.md").write_bytes(b"plan v2\n")
             return orig(self.gh, argv)
         self.m_gate_run.side_effect = gh
-        self.tick("DONE")
+        self.tick("DONE")    # такт ready: мерджа в нём нет
+        self.assertEqual(self.gh.merges(), [])
+        self.tick()          # следующий такт: свежий гейт видит изменённый план
         self.assertEqual(self.gh.merges(), [])
         self.assertTrue(self.status().startswith("BLOCKED: plan changed since approval:"), self.status())
         self.assertNotIn("merge", self.w())
 
+    def kinds(self):
+        return [c[2] for c in self.gh.calls if c[:2] == ["gh", "pr"] and c[2] in ("ready", "merge")]
+
     def test_draft_is_readied_first(self):
         self.gh.draft = True
         self.tick("DONE")
-        kinds = [c[:3] for c in self.gh.calls if c[:2] == ["gh", "pr"] and c[2] in ("ready", "merge")]
-        self.assertEqual(kinds, [["gh", "pr", "ready"], ["gh", "pr", "merge"]])
+        self.assertEqual(self.kinds(), ["ready"])         # такт ready завершается без мерджа
+        self.assertNotIn("merge", self.w())
+        self.tick()
+        self.assertEqual(self.kinds(), ["ready", "merge"])
+
+    def test_ready_then_pending_then_green_merges_once(self):
+        self.gh.draft = True
+        self.tick("DONE")
+        self.assertEqual(self.kinds(), ["ready"])
+        self.assertNotIn("merge", self.w())
+        # ready_for_review запустил новый check-run на том же SHA
+        self.gh.runs = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                        {"name": "review", "status": "queued", "conclusion": None}]
+        self.tick()
+        self.assertEqual(self.gh.merges(), [])
+        self.assertEqual(self.w()["gate"]["verdict"], "wait")
+        self.gh.runs = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                        {"name": "review", "status": "completed", "conclusion": "success"}]
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.gh.merges()), 1)
+        self.assertEqual(self.kinds().count("ready"), 1)
+
+    def test_ready_then_red_check_blocks_never_merges(self):
+        self.gh.draft = True
+        self.tick("DONE")
+        self.gh.runs = [{"name": "ci", "status": "completed", "conclusion": "success"},
+                        {"name": "review", "status": "completed", "conclusion": "failure"}]
+        self.tick()
+        self.tick()
+        self.assertEqual(self.gh.merges(), [])
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: check-runs не успешны: review=failure"),
+                        self.status())
 
     def test_merge_refused_blocks_and_never_repeats(self):
         self.gh.merge_rc, self.gh.merge_err = 1, "Pull request is not mergeable"

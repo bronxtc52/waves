@@ -1317,6 +1317,11 @@ def _automerge(cfg, st, wave, w, pr, now):
         if rc != 0:
             # полный stderr: _gate_fail вычищает его целиком и только потом режет
             return _gate_fail(cfg, st, wave, w, [f"gh pr ready отказал: {gate._line(err or 'без текста')}"], pr, now)
+        # инвариант: такт ready на этом заканчивается. ready_for_review может запустить новые check-runs
+        # на том же SHA, а факты этого такта собраны до ready: мердж — только на следующем такте,
+        # когда свежие collect_facts+decide дадут pass уже не черновику. w["merge"] не пишется
+        return _gate_wait(cfg, st, wave, w, [f"PR #{number} переведён из черновика, жду свежих check-runs"],
+                          pr, now)
     # инвариант: пин — непосредственно перед записью merge и `gh pr merge`, без сетевых вызовов между
     # ними (`gh pr ready` выше мог идти секунды, план за это время могли поменять)
     plan = gate.plan_problem(cfg)
