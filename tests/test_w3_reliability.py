@@ -13,6 +13,7 @@ import helpers
 from helpers import good, write_json
 
 import wab
+from test_w4_flow import Gh
 from test_dash import dash, FakeRich, flatten
 
 
@@ -96,12 +97,16 @@ class TestDoneAndDead(_Base):
                                                   "notified": {}, **extra}}}
 
     def test_done_with_dead_session_is_done_not_dead(self):
+        # W4: DONE с мёртвым окном идёт в гейт мерджа, а не в dead; PR смержен — волна merged
         self.patch("tmux_alive", return_value=False)
         self.patch("send_keys", return_value=None)
+        gh = Gh(self)
+        gh.state = "MERGED"
+        self.patch("gate_run", side_effect=gh)
         self.set_status("DONE")
-        st = self.state()
-        self.assertFalse(self.tick(st))
-        self.assertEqual(st["waves"]["W1"]["phase"], "done")
+        st = self.state(cwd=str(self.dir))
+        self.assertFalse(self.tick(st))   # у W1 нет next-prompt.md: цепочка стоит
+        self.assertEqual(st["waves"]["W1"]["phase"], "merged")
         self.assertNotIn("закрыта", self.log())
         self.assertIn("W1: DONE", self.log())
 

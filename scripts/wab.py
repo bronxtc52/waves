@@ -3,15 +3,18 @@
 
 Команды:
   wab.py launch <waves.json> <волна> <файл-промпта>   запустить одну волну в tmux
-  wab.py watch  <waves.json>                           следить за текущей волной до DONE
+  wab.py watch  <waves.json>                           вести цепочку: надзор, гейт мерджа, следующая волна
   wab.py status <waves.json>                           статус одним экраном
   wab.py validate <waves.json>                         проверить конфиг и напечатать его
   wab.py models <waves.json> [--refresh]               роли → модели с проверкой доступности и fallback
 
 Каждая сессия волны пишет $WAB_DIR/status (RUNNING | HANDOFF_READY | BLOCKED: … | DONE),
 handoff.md, result.md, next-prompt.md — см. PROTOCOL.md в корне репозитория.
-После DONE диспетчер закрывает окно волны и останавливается: следующую волну сам не
-запускает (сначала мердж PR и решение координатора), а печатает команду launch для неё.
+После DONE — гейт мерджа (scripts/gate.py): PR ветки волны, HEAD, чистое дерево, check-runs, пин
+плана. Отказ — `BLOCKED: merge gate: …` в status и причина в окно волны. Пройден — ждём мерджа
+человеком (automerge выкл.) или делаем ровно один `gh pr merge --match-head-commit` (automerge вкл.).
+После MERGED и проверки merge-коммита в origin/<base_branch> окно закрывается, а watch сам
+запускает следующую волну по её next-prompt.md (вне блокировки прогона); итог — chain-result.md.
 Нужен tmux >= 3.2: new-session принимает команду списком аргументов (3.0+) и ключ -e (3.2+).
 Нужен git >= 2.36: пути worktree читаются из `git worktree list --porcelain -z`.
 Импорт модуля ничего не запускает и не создаёт файлов.
@@ -26,12 +29,12 @@ import os
 import pathlib
 import re
 import shlex
-import stat
 import subprocess
 import sys
 import time
 import uuid
 
+import gate
 import waves_config
 from waves_config import ConfigError, load_waves
 
@@ -54,7 +57,9 @@ TAIL_BYTES = 4_000_000         # контекст меряется по посл
 FIRST_MESSAGE_BYTES = 256 * 1024
 HEAD_BYTES = 4096              # проверка подлинности журнала: хеш первых 4 КБ
 READ_CHUNK = 1 << 20
-PLAN_MAX_BYTES = 1024 * 1024   # waves.md крупнее мегабайта — не план
+QUESTIONS_LIMIT = 20           # сколько вопросов BLOCKED волны хранить для chain-result.md
+GATE_PHASES = ("gate", "awaiting_merge")
+PLAN_MAX_BYTES = gate.PLAN_MAX_BYTES  # waves.md крупнее мегабайта — не план (чтение плана — gate.plan_issue)
 
 
 # ---------- конфиг и состояние ----------
@@ -640,6 +645,11 @@ def _is_worktree_of(wt, branch, checkout):
     return r.returncode == 0 and r.stdout.removesuffix("\n") == f"refs/heads/{branch}"
 
 
+def wave_branch(cfg, wave):
+    """Ветка волны: из неё волна открывает PR, по ней гейт ищет этот PR."""
+    return f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
+
+
 def prepare_worktree(cfg, wave):
     """Готовит git worktree волны и возвращает его путь.
 
@@ -672,7 +682,7 @@ def prepare_worktree(cfg, wave):
                          f"ничего не тронуто")
     if wt.exists() and not wt.is_dir():
         raise SystemExit(f"{wt} — файл, а не каталог волны; уберите его вручную, ничего не тронуто")
-    branch = f"wab/{cfg['chain']}/{cfg['run_id']}/{wave}"
+    branch = wave_branch(cfg, wave)
 
     def listing_raw():
         # -z: путь отдаётся как есть, без кавычек и экранирования (core.quotePath), даже с переводом строки
@@ -767,8 +777,9 @@ def _update_wave(cfg, wave, **fields):
         return w
 
 
-def _release_reservation(cfg, wave, prev_current, prev_rec):
-    """Снять резерв неудачного launch: вернуть прежний current и прежнюю запись волны (или убрать её)."""
+def _release_reservation(cfg, wave, prev_current, prev_rec, prev_pending=None):
+    """Снять резерв неудачного launch: вернуть прежний current, прежнюю запись волны (или убрать её)
+    и снятый резервом pending_launch — автопродолжение не теряется, рестарт watch попробует снова."""
     with run_lock(cfg):
         st = load_state(cfg)
         if st.get("current") != wave or (st.get("waves", {}).get(wave) or {}).get("launcher_pid") != os.getpid():
@@ -778,6 +789,8 @@ def _release_reservation(cfg, wave, prev_current, prev_rec):
             st["waves"].pop(wave, None)
         else:
             st["waves"][wave] = prev_rec
+        if prev_pending and not st.get("pending_launch"):
+            st["pending_launch"] = prev_pending
         save_state(cfg, st)
 
 
@@ -841,32 +854,11 @@ def check_plan(cfg):
               file=sys.stderr)
         return
     path = cfg["plan_path"]
-
-    def refuse(why, short=None):
+    issue = gate.plan_issue(cfg)
+    if issue:
+        why, short = issue
         event(cfg, f"BLOCKED: plan changed since approval: {short or why}", trusted=f" (файл {path})")
         raise SystemExit(f"BLOCKED: plan changed since approval: {why} (файл {path})")
-
-    try:
-        # O_NONBLOCK: FIFO без писателя вечно ждёт при открытии; тип проверяется по fstat ниже
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    except FileNotFoundError:
-        refuse("файла waves.md нет")
-    except OSError as e:
-        refuse(f"waves.md не открыт (симлинк или нет доступа): {e.strerror or e}")
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            refuse("waves.md не обычный файл")
-        with os.fdopen(fd, "rb", closefd=False) as f:
-            data = f.read(PLAN_MAX_BYTES + 1)
-    finally:
-        os.close(fd)
-    if len(data) > PLAN_MAX_BYTES:
-        refuse(f"waves.md больше {PLAN_MAX_BYTES // (1024 * 1024)} МБ")
-    got = hashlib.sha256(data).hexdigest()
-    if got != want:
-        refuse(f"sha256 waves.md не совпадает с plan_sha256 (в конфиге {want[:12]}…, в файле {got[:12]}…)",
-               short="sha256 waves.md не совпадает с plan_sha256")
-
 
 def launch(cfg, wave, prompt_file):
     """Запустить одну волну. False, если окно Claude не стало готовым: тогда ничего не отправляем."""
@@ -905,6 +897,13 @@ def launch(cfg, wave, prompt_file):
         if old or (prev_rec or {}).get("attempts"):
             rec["attempts"] = [*((prev_rec or {}).get("attempts") or []), {"sessions": list(old or [])}]
         st["waves"][wave] = rec
+        # pending_launch этой волны снимается в той же блокировке и тем же сохранением, что и резерв:
+        # между снятием и резервом нет окна, где остановка теряла бы автопродолжение
+        prev_pending = st.get("pending_launch")
+        if (prev_pending or {}).get("wave") == wave:
+            st.pop("pending_launch")
+        else:
+            prev_pending = None
         save_state(cfg, st)
     try:
         wdir = wave_dir(cfg, wave)
@@ -922,7 +921,7 @@ def launch(cfg, wave, prompt_file):
             raise SystemExit(f"tmux new-session не запущен: {e}")
     except BaseException:
         # неудачный launch не должен оставить цепочку «занятой»
-        _release_reservation(cfg, wave, cur, prev_rec)
+        _release_reservation(cfg, wave, cur, prev_rec, prev_pending)
         raise
     # сессия создана: публикуем cwd до ожидания — диспетчер, упавший здесь, не потеряет сессию
     _update_wave(cfg, wave, cwd=cwd)
@@ -1010,9 +1009,12 @@ def wave_argv(cfg, wave, roles, system_prompt_path, session_id=None):
 def probe_model(model, timeout=PROBE_TIMEOUT_SECONDS):
     """Доступна ли модель: короткий `claude -p`. (ok, detail); вывод модели и stderr не возвращаем."""
     try:
+        # не-UTF-8 локаль (LC_ALL=C без UTF-8 mode): кириллица в argv кодируется явно, вывод claude
+        # читается как UTF-8 с заменой — иначе UnicodeEncodeError/UnicodeDecodeError вместо ответа
         r = subprocess.run(["claude", "-p", "--model", model, "--no-session-persistence",
-                            "Ответь одним словом: ok"],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+                            "Ответь одним словом: ok".encode("utf-8")],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, "timeout"
     except FileNotFoundError:
@@ -1194,10 +1196,295 @@ def continue_status_note(cfg, wave):
             f"(начинается с метки {session_marker(cfg, wave)}); без метки новая сессия не привяжется")
 
 
+# ---------- гейт мерджа и переход к следующей волне ----------
+
+def gate_run(argv):
+    """Все вызовы gh/git гейта идут здесь: тесты подменяют эту функцию и считают вызовы."""
+    return gate.default_run(argv)
+
+
+def _gate_record(w, verdict, reasons, pr, now):
+    """Вердикт для дашборда: причины вычищены (в них stderr gh и тексты GitHub)."""
+    w["gate"] = {"verdict": verdict, "reasons": [redact(r, gate.ERROR_LIMIT) for r in reasons], "at": now,
+                 "pr": (pr or {}).get("number")}
+
+
+def _gate_fail(cfg, st, wave, w, reasons, pr, now):
+    """Гейт не пройден: BLOCKED в status, причина в окно волны, фаза running.
+
+    Дальше работает обычная ветка BLOCKED, а новый DONE агента снова запускает гейт. Мерджа нет,
+    следующая волна не стартует.
+    """
+    plan = next((r for r in reasons if r.startswith(gate.PLAN_PREFIX)), None)
+    why = redact(plan or "; ".join(reasons))
+    msg = f"BLOCKED: {why}" if plan else f"BLOCKED: merge gate: {why}"
+    _gate_record(w, "fail", reasons, pr, now)
+    w["phase"] = "running"
+    w["notified"].pop("gate", None)
+    w["notified"]["blocked"] = msg   # ветка BLOCKED на следующем тике не повторит событие
+    (wave_dir(cfg, wave) / "status").write_text(msg + "\n", encoding="utf-8")
+    save_state(cfg, st)
+    event(cfg, f"{wave}: {msg}")
+    if tmux_alive(w["tmux"]):
+        try:
+            send_text(w["tmux"], f"[wab] Гейт мерджа не пройден: {why}. Исправь и снова запиши DONE в status.")
+        except (subprocess.CalledProcessError, OSError) as e:
+            event(cfg, f"{wave}: причину отказа гейта не удалось отправить в окно: {e}")
+    return True
+
+
+def _gate_wait(cfg, st, wave, w, reasons, pr, now):
+    _gate_record(w, "wait", reasons, pr, now)
+    if once_per(w, "gate", "\n".join(w["gate"]["reasons"])):   # событие — только при смене причины
+        event(cfg, f"{wave}: гейт мерджа ждёт: {'; '.join(reasons)}")
+    save_state(cfg, st)
+    return True
+
+
+def _pr_info(pr):
+    return {"number": pr.get("number"), "url": pr.get("url"), "sha": pr.get("headRefOid")}
+
+
+def _gate_tick(cfg, st, wave, w, waves_json):
+    """Такт гейта на DONE (фазы gate/awaiting_merge): факты → решение → ждать, BLOCKED, мердж или переход."""
+    now = time.time()
+    unverified = w.get("phase") == "merge_unverified"   # wait держит эту фазу, а не возвращает в gate
+    if w.get("phase") not in GATE_PHASES and not unverified:
+        w["phase"] = "gate"   # фаза — в state до любых действий
+        w.pop("gate", None)
+        w["notified"].pop("gate", None)
+        save_state(cfg, st)
+        event(cfg, f"{wave}: DONE, проверяю гейт мерджа")
+    facts = gate.collect_facts(cfg, wave_branch(cfg, wave), w.get("cwd") or "", run=gate_run,
+                               base=cfg["base_branch"])
+    verdict, reasons = gate.decide(facts)
+    pr = facts.get("pr")
+    if verdict == "wait":
+        return _gate_wait(cfg, st, wave, w, reasons, pr, now)
+    if verdict == "fail":
+        return _gate_fail(cfg, st, wave, w, reasons, pr, now)
+    if unverified and verdict != "merged":
+        # PR снова не MERGED (pass): мерджа из этой фазы нет никогда — только ждать
+        return _gate_wait(cfg, st, wave, w, [f"PR #{(pr or {}).get('number')} больше не в состоянии MERGED"],
+                          pr, now)
+    if verdict == "merged":
+        oid = ((pr.get("mergeCommit") or {}).get("oid") or "")
+        w["pr"] = _pr_info(pr)
+        w["merged_pending"] = {"pr": pr.get("number"), "oid": oid}
+        w["phase"] = "merge_unverified"
+        w.pop("gate", None)
+        save_state(cfg, st)
+        return _verify_merge(cfg, st, wave, w, waves_json)
+    # pass
+    w["pr"] = _pr_info(pr)
+    _gate_record(w, "pass", [], pr, now)
+    if not cfg.get("automerge"):
+        w["phase"] = "awaiting_merge"
+        if once_per(w, "awaiting", str(pr.get("number"))):
+            event(cfg, f"{wave}: ждёт мерджа PR #{pr.get('number')}", trusted=f" {pr.get('url') or ''}")
+        save_state(cfg, st)
+        return True
+    return _automerge(cfg, st, wave, w, pr, now)
+
+
+def _automerge(cfg, st, wave, w, pr, now):
+    """Ровно один `gh pr merge` на проверенный sha; запись о мердже — на диске до вызова."""
+    repo, number, sha = cfg["repo"], pr.get("number"), pr.get("headRefOid")
+    rec = w.get("merge")
+    if rec and rec.get("sha") == sha:
+        # уже мерджили этот sha (или упали посреди вызова): повторно нельзя, ждём MERGED
+        if rec.get("rc") not in (None, 0):
+            return _gate_fail(cfg, st, wave, w, [f"gh pr merge отказал: {rec.get('stderr') or 'без текста'}"],
+                              pr, now)
+        w["phase"] = "awaiting_merge"
+        return _gate_wait(cfg, st, wave, w, [f"мердж PR #{number} отправлен, жду MERGED"], pr, now)
+    try:
+        fresh = gate.head_still(repo, number, sha, run=gate_run)
+    except gate.GateError as e:
+        return _gate_wait(cfg, st, wave, w, [str(e)], pr, now)
+    if not fresh["same_head"] or fresh["state"] != "OPEN":
+        return _gate_wait(cfg, st, wave, w, [f"PR #{number} сменился перед мерджем: HEAD "
+                                             f"{fresh['headRefOid'][:12]}, состояние {fresh['state']}"], pr, now)
+    # пин плана — ещё раз прямо перед мерджем и до `gh pr ready`: при изменённом плане PR не трогаем
+    plan = gate.plan_problem(cfg)
+    if plan:
+        return _gate_fail(cfg, st, wave, w, [gate.PLAN_PREFIX + plan], pr, now)
+    if fresh["isDraft"]:
+        try:
+            rc, _out, err = gate_run(["gh", "pr", "ready", str(number), "--repo", repo])
+        except (gate.GateError, subprocess.TimeoutExpired, OSError) as e:
+            rc, err = -1, str(e)
+        if rc != 0:
+            # полный stderr: _gate_fail вычищает его целиком и только потом режет
+            return _gate_fail(cfg, st, wave, w, [f"gh pr ready отказал: {gate._line(err or 'без текста')}"], pr, now)
+        # инвариант: такт ready на этом заканчивается. ready_for_review может запустить новые check-runs
+        # на том же SHA, а факты этого такта собраны до ready: мердж — только на следующем такте,
+        # когда свежие collect_facts+decide дадут pass уже не черновику. w["merge"] не пишется
+        return _gate_wait(cfg, st, wave, w, [f"PR #{number} переведён из черновика, жду свежих check-runs"],
+                          pr, now)
+    # инвариант: пин — непосредственно перед записью merge и `gh pr merge`, без сетевых вызовов между
+    # ними (`gh pr ready` выше мог идти секунды, план за это время могли поменять)
+    plan = gate.plan_problem(cfg)
+    if plan:
+        return _gate_fail(cfg, st, wave, w, [gate.PLAN_PREFIX + plan], pr, now)
+    w["merge"] = {"sha": sha, "pr": number, "at": now, "rc": None}
+    w["phase"] = "awaiting_merge"
+    save_state(cfg, st)   # ДО вызова: упавший здесь диспетчер не смержит повторно
+    try:
+        rc, _out, err = gate_run(["gh", "pr", "merge", str(number), "--repo", repo, "--squash",
+                                  "--match-head-commit", sha])
+    except (gate.GateError, subprocess.TimeoutExpired, OSError) as e:
+        rc, err = -1, str(e)
+    w["merge"]["rc"] = rc
+    w["merge"]["stderr"] = redact(gate._line(err or ""), gate.ERROR_LIMIT)   # redact до усечения
+    save_state(cfg, st)
+    if rc != 0:
+        return _gate_fail(cfg, st, wave, w, [f"gh pr merge отказал: {w['merge']['stderr'] or 'без текста'}"],
+                          pr, now)
+    event(cfg, f"{wave}: PR #{number} отправлен в мердж (squash, HEAD {sha[:12]})")
+    return True
+
+
+def _verify_merge(cfg, st, wave, w, waves_json):
+    """merge-коммит должен быть в origin/<base>: иначе следующая волна стартовала бы без этой."""
+    now = time.time()
+    mp = w.get("merged_pending") or {}
+    oid, base, checkout = mp.get("oid") or "", cfg["base_branch"], str(cfg["checkout"])
+    ok = False
+    if oid:
+        try:
+            # явный refspec: в single-branch клоне обычный fetch кладёт базу только в FETCH_HEAD
+            rc, _o, _e = gate_run(["git", "-C", checkout, "fetch", "origin",
+                                   f"+refs/heads/{base}:refs/remotes/origin/{base}"])
+            if rc == 0:
+                rc, _o, _e = gate_run(["git", "-C", checkout, "merge-base", "--is-ancestor", oid, f"origin/{base}"])
+                ok = rc == 0
+        except (gate.GateError, subprocess.TimeoutExpired, OSError):
+            ok = False
+    if not ok:
+        msg = f"BLOCKED: merge gate: merge-коммит {oid[:12] or '?'} не в origin/{base}"
+        w["phase"] = "merge_unverified"
+        if once_per(w, "unverified", msg):
+            w["notified"]["blocked"] = msg
+            (wave_dir(cfg, wave) / "status").write_text(msg + "\n", encoding="utf-8")
+            event(cfg, f"{wave}: {msg}; проверю снова на следующем такте")
+        save_state(cfg, st)
+        return True
+    w["merged"] = {"pr": mp.get("pr"), "oid": oid, "at": now}
+    w.pop("merged_pending", None)
+    w["phase"] = "merged"
+    w["finished"] = now
+    st["current"] = None
+    ids = wave_ids(cfg)
+    idx = ids.index(wave)
+    nxt = wave_path(cfg, wave) / "next-prompt.md"
+    last, has_next = idx + 1 >= len(ids), nxt.exists()
+    # без пина плана автозапуск следующей волны запрещён: launch без plan_sha256 не сверяет waves.md
+    pinned = bool(cfg.get("plan_sha256"))
+    if not last and has_next and pinned:
+        st["pending_launch"] = {"wave": ids[idx + 1], "prompt": str(nxt), "after": wave}
+    else:
+        write_chain_result(cfg, st)   # до сохранения: остановка между ними не теряет итог (повтор перепишет)
+    # инвариант: /exit — ДО сохранения, завершающего волну. Остановка после /exit и до сохранения
+    # оставляет merge_unverified: следующий такт пройдёт тот же путь (повтор /exit безвреден, мёртвое
+    # окно на DONE не делает волну dead). Остановка после сохранения не оставит открытого окна
+    send_keys(w["tmux"], "-l", "/exit", check=False)
+    send_keys(w["tmux"], "Enter", check=False)
+    # инвариант: завершение волны и намерение перехода — ОДНО сохранение. Остановка после него
+    # не теряет автопродолжение: перезапущенный watch увидит pending_launch
+    save_state(cfg, st)
+    event(cfg, f"{wave}: PR #{mp.get('pr')} смержен ({oid[:12]} в origin/{base}), окно волны закрыто")
+    if last:
+        event(cfg, "цепочка завершена", trusted=f"; итог: {cfg['run_dir'] / 'chain-result.md'}")
+        return False
+    if not has_next:
+        event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
+        return False
+    if not pinned:
+        _manual_launch_hint(cfg, f"{wave} смержена; нет plan_sha256 — следующую волну {ids[idx + 1]} "
+                                 f"запустите вручную.", ids[idx + 1], nxt, waves_json)
+        return False
+    return _announce_next(cfg, wave, ids[idx + 1], nxt, waves_json)
+
+
+def _manual_launch_hint(cfg, text, nxt_wave, nxt, waves_json):
+    """Событие `text` с командой ручного launch; команда собрана из путей диспетчера (не вычищается)."""
+    args = [waves_json or "", nxt_wave, str(nxt)]
+    if any(_has_line_break(a) for a in args):
+        # event() склеивает строки trusted в одну: команда указала бы на другой путь
+        event(cfg, f"{text} Путь содержит перевод строки — команду ручного запуска не печатаю.")
+    else:
+        target = shlex.quote(waves_json) if waves_json else "<waves.json>"
+        cmd = " ".join(["wab.py", "launch", target, shlex.quote(nxt_wave), shlex.quote(str(nxt))])
+        event(cfg, text, trusted=" Следующая волна: " + cmd)
+
+
+def _announce_next(cfg, wave, nxt_wave, nxt, waves_json):
+    """Событие об автозапуске следующей волны (pending_launch уже сохранён) с ручной командой
+    на случай, если автозапуск откажет."""
+    _manual_launch_hint(cfg, f"{wave}: смержена; следующая волна {nxt_wave} стартует автоматически.",
+                        nxt_wave, nxt, waves_json)
+    return True
+
+
+def _fence(text):
+    """Ограда блока кода длиннее любой серии обратных кавычек в тексте: строки не ломают разметку."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _when(ts):
+    return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(ts)) if isinstance(ts, (int, float)) else "—"
+
+
+def write_chain_result(cfg, st):
+    """chain-result.md в run_dir (атомарно: tmp + os.replace): по волне — PR, merge-коммит, перезапуски,
+    вопросы BLOCKED, время. Вопросы — текст сессии волны (недоверенный): только внутри блока кода."""
+    out = [f"# Итог цепочки {cfg['chain']} / {cfg['run_id']}", "",
+           f"Сформирован: {_when(time.time())}", ""]
+    for wobj in cfg["waves"]:
+        wid = wobj["id"]
+        w = (st.get("waves") or {}).get(wid)
+        out += [f"## {wid} — {wobj['title']}", ""]
+        if not w:
+            out += ["Не запускалась.", ""]
+            continue
+        pr, merged = w.get("pr") or {}, w.get("merged") or {}
+        if pr.get("number"):
+            out.append(f"- PR: #{pr['number']} {pr.get('url') or ''}".rstrip())
+        else:
+            out.append("- PR: —")
+        if merged.get("oid"):
+            out.append(f"- Merge-коммит: `{merged['oid'][:12]}`, смержен {_when(merged.get('at'))}")
+        else:
+            out.append(f"- Не смержена (фаза {w.get('phase') or '?'})")
+        out.append(f"- Перезапуски после /clear: {w.get('restarts') or 0}; попыток запуска: "
+                   f"{len(w.get('attempts') or []) + 1}")
+        start, end = w.get("started"), merged.get("at") or w.get("finished")
+        dur = ""
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            mins = int(max(0, end - start) // 60)
+            dur = f" ({mins // 60} ч {mins % 60} мин)"
+        out.append(f"- Время: {_when(start)} → {_when(end)}{dur}")
+        qs = w.get("questions") or []
+        if qs:
+            body = "\n\n".join(redact(q) for q in qs)
+            fence = _fence(body)
+            out += ["- Вопросы BLOCKED:", "", fence + "text", body, fence]
+        out.append("")
+    path = cfg["run_dir"] / "chain-result.md"
+    cfg["run_dir"].mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".chain-result.md.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(out), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
 def tick(cfg, st, waves_json=None):
     wave = st.get("current")
     if not wave:
-        return False
+        # следующую волну запускает _watch_loop вне блокировки; без неё смотреть не за чем
+        return bool(st.get("pending_launch"))
     w = st["waves"][wave]
     if w.get("phase") in ("starting", "sending") and _pid_alive(w.get("launcher_pid")):
         return True  # launch ещё создаёт worktree и сессию: не считать её мёртвой, ждать
@@ -1206,37 +1493,23 @@ def tick(cfg, st, waves_json=None):
     now = time.time()
     attach = f"tmux attach -t ={name}  (выйти: Ctrl-b d)"
 
-    # сначала DONE: волна могла закончиться и закрыть окно между двумя тиками
+    # merge-коммит уже есть, но его ещё не видно в origin/<base>: только повторная проверка
+    # merge_unverified проходит гейт заново (не _verify_merge напрямую): CI финального HEAD мог
+    # перезапуститься и стать pending/failure, пока merge-коммит догонял origin/<base>
+    if w.get("phase") == "merge_unverified":
+        return _gate_tick(cfg, st, wave, w, waves_json)
+    # сначала DONE: волна могла закончиться и закрыть окно между двумя тиками. DONE — это «PR готов,
+    # CI зелёный», а не «смержено»: дальше решает гейт мерджа (окно не закрывается до MERGED)
     if status == "DONE":
-        # DONE — это «PR готов, CI зелёный», а не «смержено». Следующая волна строится от
-        # свежего origin/<base_branch>, поэтому без мерджа она стартовала бы без этой волны.
-        # Диспетчер сам следующую волну не запускает: цепочка стоит до мерджа и координатора.
-        nxt = wdir / "next-prompt.md"
-        ids = wave_ids(cfg)
-        idx = ids.index(wave)
-        event(cfg, f"{wave}: DONE")
-        send_keys(name, "-l", "/exit", check=False)
-        send_keys(name, "Enter", check=False)
-        w["phase"] = "done"
-        w["finished"] = now
-        st["current"] = None
+        return _gate_tick(cfg, st, wave, w, waves_json)
+    if w.get("phase") in GATE_PHASES:
+        # агент снова работает (RUNNING/BLOCKED вместо DONE): гейт снят. w["merge"] не трогаем —
+        # повторный мердж того же sha запрещён
+        w["phase"] = "running"
+        w.pop("gate", None)
+        w["notified"].pop("gate", None)
+        event(cfg, f"{wave}: статус «{status}» вместо DONE — гейт мерджа снят, слежу дальше")
         save_state(cfg, st)
-        if idx + 1 >= len(ids):
-            event(cfg, "цепочка завершена")
-        elif not nxt.exists():
-            event(cfg, f"{wave} готова, но нет next-prompt.md — следующую волну не запускаю")
-        else:
-            # команду собирает сам диспетчер из своих путей: квотируем для shell, не вычищаем
-            args = [waves_json or "", ids[idx + 1], str(nxt)]
-            if any(_has_line_break(a) for a in args):
-                # event() склеивает строки trusted в одну: команда указала бы на другой путь
-                event(cfg, f"{wave}: готова; жду мерджа PR и координатора. Путь содержит перевод "
-                           f"строки — команду не печатаю, запустите следующую волну {ids[idx + 1]} вручную.")
-            else:
-                target = shlex.quote(waves_json) if waves_json else "<waves.json>"
-                cmd = " ".join(["wab.py", "launch", target, shlex.quote(ids[idx + 1]), shlex.quote(str(nxt))])
-                event(cfg, f"{wave}: готова; жду мерджа PR и координатора.", trusted=" Следующая волна: " + cmd)
-        return False
 
     if not tmux_alive(name):
         if once_per(w, "dead", "1"):
@@ -1301,6 +1574,10 @@ def tick(cfg, st, waves_json=None):
         return True
 
     if status.startswith("BLOCKED"):
+        q = redact(status)
+        qs = w.setdefault("questions", [])
+        if q not in qs and len(qs) < QUESTIONS_LIMIT:   # для chain-result.md
+            qs.append(q)
         if once_per(w, "blocked", status):
             # статус целиком: event() вычищает до ограничения длины; срез сырого текста здесь
             # оставил бы от секрета на границе обрывок короче порога шаблона, и он ушёл бы открытым
@@ -1394,6 +1671,9 @@ def tick(cfg, st, waves_json=None):
             return True
         w["phase"] = "resuming"  # до отправки: перезапущенный watch не досылает продолжение вслепую
         save_state(cfg, st)
+        # RESUMING — до отправки: быстрый агент успевает записать RUNNING/BLOCKED/DONE, и запись
+        # после send_text затёрла бы его статус. После отправки status не трогаем
+        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
         # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update;
         # метка волны в начале — по ней находится новый журнал сессии
         send_text(name, continue_text(cfg, wave, wdir))
@@ -1405,7 +1685,6 @@ def tick(cfg, st, waves_json=None):
         w["checkpoint_at"] = None
         w.pop("clear_at", None)
         w.pop("clear_sent", None)
-        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
         save_state(cfg, st)
         return True
 
@@ -1495,6 +1774,14 @@ def tick(cfg, st, waves_json=None):
     return True
 
 
+def _pending_launch(cfg):
+    """pending_launch из state, если текущей волны нет. Только чтение: снимает его резерв launch."""
+    with run_lock(cfg):
+        st = load_state(cfg)
+    pend = st.get("pending_launch")
+    return pend if pend and not st.get("current") else None
+
+
 def watch(cfg, path):
     require_tmux()
     with dispatcher_lock(cfg):  # на всё время слежения; снимается при выходе из процесса
@@ -1526,6 +1813,25 @@ def _watch_loop(cfg, path):
         if not alive:
             event(cfg, "watch остановлен: нет текущей волны")
             return
+        # следующая волна — ВНЕ блокировки тика: launch сам берёт run_lock (flock не реентерабелен)
+        # и ждёт окно Claude до 90 с. Так же на первом такте перезапущенного watch с pending_launch
+        # pending_launch watch не снимает: его снимает сам launch в блокировке резерва. SystemExit до
+        # резерва оставляет его в state — перезапуск watch попробует снова
+        pend = _pending_launch(cfg)
+        if pend:
+            event(cfg, f"запускаю {pend['wave']} (после {pend.get('after') or '?'})")
+            try:
+                ok = launch(cfg, pend["wave"], pend["prompt"])
+            except SystemExit as e:
+                event(cfg, f"{pend['wave']}: launch не выполнен: {e}")
+                event(cfg, "watch остановлен: следующая волна не запущена, pending_launch сохранён")
+                return
+            if _pending_launch(cfg) == pend:
+                # резерва не случилось (launch вернулся, не тронув state): без этого — горячий цикл
+                event(cfg, f"watch остановлен: {pend['wave']} не зарезервирована, pending_launch сохранён")
+                return
+            if not ok:
+                event(cfg, f"{pend['wave']}: launch не довёл задачу до окна; слежу дальше (фаза not_ready)")
         st = load_state(cfg)
         w = st["waves"].get(st.get("current") or "", {})
         if time.time() - last > 600 and w:

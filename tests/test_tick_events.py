@@ -1,5 +1,6 @@
 """tick() при DONE и вычистка секретов в event(): без tmux, всё внешнее подменено."""
 import contextlib
+import hashlib
 import io
 import os
 import pathlib
@@ -12,9 +13,18 @@ import helpers  # noqa: F401  (кладёт scripts/ в sys.path)
 from helpers import good, write_json
 
 import wab
+from test_w4_flow import Gh
 
 TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # 36 символов после префикса
 MAIL = "someone.person@example.org"
+
+
+def pinned_good(directory):
+    """Хороший конфиг с пином плана и сам waves.md рядом (автозапуск следующей волны требует пина)."""
+    d = good()
+    d["plan_sha256"] = hashlib.sha256(b"plan\n").hexdigest()
+    (pathlib.Path(directory) / "waves.md").write_bytes(b"plan\n")
+    return d
 
 
 class _Base(unittest.TestCase):
@@ -31,11 +41,21 @@ class _Base(unittest.TestCase):
 
 
 class TestDone(_Base):
-    """DONE: окно закрыто, цепочка стоит, следующая волна не запускается сама."""
+    """DONE и PR уже смержен (W4): окно закрыто, следующая волна — через pending_launch, tick её не запускает.
+
+    Сам гейт подробно — в test_w4_flow; здесь gh/git подменены ответом «PR смержен, коммит в origin»."""
 
     def setUp(self):
         super().setUp()
+        # автозапуск следующей волны (pending_launch) — только с пином плана
+        self.cfg_path = write_json(self.dir, pinned_good(self.dir))
+        self.cfg = wab.load_waves(str(self.cfg_path))
         self.sent = []
+        self.gh = Gh(self)
+        self.gh.state = "MERGED"
+        pt = mock.patch.object(wab, "gate_run", side_effect=lambda argv: self.gh(argv))
+        pt.start()
+        self.addCleanup(pt.stop)
         for name, kw in (("send_keys", {"side_effect": lambda *a, **k: self.sent.append(a)}),
                          ("tmux_alive", {"return_value": True}),
                          ("require_tmux", {"return_value": None}),   # watch() проверяет tmux; на CI-раннере его может не быть
@@ -46,7 +66,7 @@ class TestDone(_Base):
 
     def state(self, wave):
         return {"current": wave, "waves": {wave: {"tmux": f"wab-demo-{wave}", "phase": "running",
-                                                  "restarts": 0, "notified": {}}}}
+                                                  "restarts": 0, "notified": {}, "cwd": str(self.dir)}}}
 
     def finish(self, wave, next_prompt=True):
         wdir = wab.wave_dir(self.cfg, wave)
@@ -59,30 +79,31 @@ class TestDone(_Base):
         with contextlib.redirect_stdout(io.StringIO()):
             return wab.tick(self.cfg, st, **kw)
 
-    def assert_stopped(self, st, wave):
-        self.m_launch.assert_not_called()
+    def assert_stopped(self, st, wave, pending=None):
+        self.m_launch.assert_not_called()   # запуск следующей волны — дело _watch_loop вне блокировки
         self.assertIsNone(st["current"])
-        self.assertEqual(st["waves"][wave]["phase"], "done")
+        self.assertEqual(st["waves"][wave]["phase"], "merged")
         self.assertIn("finished", st["waves"][wave])
         saved = wab.load_state(self.cfg)
         self.assertIsNone(saved["current"])
-        self.assertEqual(saved["waves"][wave]["phase"], "done")
+        self.assertEqual(saved["waves"][wave]["phase"], "merged")
+        self.assertEqual((saved.get("pending_launch") or {}).get("wave"), pending)
         self.assertIn(("wab-demo-" + wave, "-l", "/exit"), self.sent)
 
-    def test_not_last_with_next_prompt_waits_for_merge(self):
+    def test_not_last_with_next_prompt_queues_next_wave(self):
         wdir = self.finish("W1")
         st = self.state("W1")
-        self.assertFalse(self.run_tick(st, waves_json=str(self.cfg_path)))
-        self.assert_stopped(st, "W1")
+        self.assertTrue(self.run_tick(st, waves_json=str(self.cfg_path)))
+        self.assert_stopped(st, "W1", pending="W2")
         log = self.log()
-        self.assertIn("жду мерджа PR и координатора", log)
+        self.assertIn("следующая волна W2 стартует автоматически", log)
         self.assertIn(f"wab.py launch {self.cfg_path} W2 {wdir / 'next-prompt.md'}", log)
 
     def test_not_last_without_waves_json_has_placeholder(self):
         wdir = self.finish("W1")
         st = self.state("W1")
-        self.assertFalse(self.run_tick(st))
-        self.assert_stopped(st, "W1")
+        self.assertTrue(self.run_tick(st))
+        self.assert_stopped(st, "W1", pending="W2")
         self.assertIn(f"wab.py launch <waves.json> W2 {wdir / 'next-prompt.md'}", self.log())
 
     def test_last_wave_chain_finished(self):
@@ -109,11 +130,11 @@ class TestDone(_Base):
         # пробел, апостроф, кириллица и длинный сегмент без дефисов (похож на «непрозрачную строку»)
         deep = self.dir / where / ("verylongprojectname" * 3)
         deep.mkdir(parents=True)
-        self.cfg_path = write_json(deep, good())
+        self.cfg_path = write_json(deep, pinned_good(deep))
         self.cfg = wab.load_waves(str(self.cfg_path))
         wdir = self.finish("W1")
         st = self.state("W1")
-        self.assertFalse(self.run_tick(st, waves_json=str(self.cfg_path)))
+        self.assertTrue(self.run_tick(st, waves_json=str(self.cfg_path)))
         self.assertEqual(self.launch_argv(),
                          ["wab.py", "launch", str(self.cfg_path), "W2", str(wdir / "next-prompt.md")])
 
@@ -133,16 +154,15 @@ class TestDone(_Base):
         # перевод строки в пути: после склейки в одну строку команда указала бы на другой путь
         deep = self.dir / where
         deep.mkdir(parents=True)
-        self.cfg_path = write_json(deep, good())
+        self.cfg_path = write_json(deep, pinned_good(deep))
         self.cfg = wab.load_waves(str(self.cfg_path))
         self.finish("W1")
         st = self.state("W1")
-        self.assertFalse(self.run_tick(st, waves_json=str(self.cfg_path)))
-        self.assert_stopped(st, "W1")
+        self.assertTrue(self.run_tick(st, waves_json=str(self.cfg_path)))
+        self.assert_stopped(st, "W1", pending="W2")
         log = self.log()
-        self.assertIn("W1: готова; жду мерджа PR и координатора.", log)
-        self.assertIn("Путь содержит перевод строки — команду не печатаю, "
-                      "запустите следующую волну W2 вручную.", log)
+        self.assertIn("W1: смержена; следующая волна W2 стартует автоматически.", log)
+        self.assertIn("Путь содержит перевод строки — команду ручного запуска не печатаю.", log)
         self.assertNotIn("wab.py launch", log)
         self.assertNotIn("Следующая волна:", log)
 
@@ -159,9 +179,9 @@ class TestDone(_Base):
         # run_dir чистый, перевод строки только в переданном пути waves.json
         self.finish("W1")
         st = self.state("W1")
-        self.assertFalse(self.run_tick(st, waves_json="/x\n/waves.json"))
-        self.assert_stopped(st, "W1")
-        self.assertIn("запустите следующую волну W2 вручную", self.log())
+        self.assertTrue(self.run_tick(st, waves_json="/x\n/waves.json"))
+        self.assert_stopped(st, "W1", pending="W2")
+        self.assertIn("команду ручного запуска не печатаю", self.log())
         self.assertNotIn("wab.py launch", self.log())
 
     def test_watch_passes_absolute_waves_json(self):
@@ -180,7 +200,7 @@ class TestDone(_Base):
         # относительный путь с длинным сегментом без дефисов: раньше становился «[скрыто].json»
         seg = "L" * 60
         (self.dir / seg).mkdir()
-        rel_target = write_json(self.dir / seg, good())
+        rel_target = write_json(self.dir / seg, pinned_good(self.dir / seg))
         cwd = os.getcwd()
         os.chdir(self.dir)
         self.addCleanup(os.chdir, cwd)
@@ -189,9 +209,10 @@ class TestDone(_Base):
         wdir = self.finish("W1")
         st = self.state("W1")
         wab.save_state(self.cfg, st)
-        with mock.patch.object(wab, "load_state", return_value=st), \
+        with mock.patch.object(wab, "load_state", return_value=st), mock.patch.object(wab.time, "sleep"), \
                 contextlib.redirect_stdout(io.StringIO()):
             wab.watch(self.cfg, rel)
+        self.m_launch.assert_called_once_with(mock.ANY, "W2", str(wdir / "next-prompt.md"))
         self.assertNotIn("[скрыто].json", self.log())
         self.assertEqual(self.launch_argv(),
                          ["wab.py", "launch", str(rel_target.resolve()), "W2", str(wdir / "next-prompt.md")])
@@ -416,6 +437,22 @@ class TestHandoffResume(_Base):
         self.assertEqual(self.calls, [])
         self.assertEqual(w["phase"], "clearing")
 
+    def test_resuming_written_before_send_and_agent_status_kept(self):
+        """RESUMING — до отправки продолжения; быстрый агент, успевший записать RUNNING, не затирается."""
+        import time as _t
+        wdir = wab.wave_dir(self.cfg, "W1")
+        seen = []
+
+        def agent_answers(name, text):
+            seen.append((wdir / "status").read_text(encoding="utf-8").strip())
+            (wdir / "status").write_text("RUNNING\n", encoding="utf-8")
+        with mock.patch.object(wab, "send_text", side_effect=agent_answers):
+            w, _ = self.tick(self.state("clearing", clear_sent=True,
+                                        clear_at=_t.time() - wab.CLEAR_SETTLE_SECONDS - 1))
+        self.assertEqual(seen, ["RESUMING"])
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RUNNING")
+        self.assertEqual(w["phase"], "running")
+
     def test_ready_after_settle_resumes_with_marker(self):
         import time as _t
         w, wdir = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - wab.CLEAR_SETTLE_SECONDS - 1))
@@ -539,8 +576,11 @@ class TestNotReadyRecovery(_Base):
                 self.assertNotIn("восстановлена вручную", self.log())
 
     def test_done_and_dead_win_over_recovery(self):
-        self.tick("DONE")
-        self.assertEqual(self.st["waves"]["W1"]["phase"], "done")
+        gh = Gh(self)
+        gh.state = "MERGED"
+        with mock.patch.object(wab, "gate_run", side_effect=gh):
+            self.tick("DONE")
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "merged")
         self.assertNotIn("восстановлена вручную", self.log())
 
     def test_dead_session_not_recovered(self):

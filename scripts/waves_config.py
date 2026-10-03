@@ -234,6 +234,9 @@ def load_waves(path):
     if sha is not None:
         c.string(sha, "plan_sha256", _SHA256)
     cfg["plan_sha256"] = sha
+    if cfg["automerge"] is True and sha is None:
+        # автомердж без пина смержил бы PR без сверки одобренного плана
+        c.err("automerge", "automerge: true требует plan_sha256 (sha256 одобренного waves.md)")
 
     roles = data.get("roles", {})
     c.obj(roles, "roles", (), set(ROLE_DEFAULTS))

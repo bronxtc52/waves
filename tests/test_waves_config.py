@@ -246,6 +246,19 @@ class TestTopLevel(LoaderBase):
         self.assertIsNone(self.load(d)["plan_sha256"])
 
 
+    def test_automerge_requires_plan_sha256(self):
+        d = good()
+        d["automerge"] = True
+        self.fails(d, "automerge: true требует plan_sha256", "sha256 одобренного waves.md")
+        d["plan_sha256"] = None
+        self.fails(d, "plan_sha256")
+        d["plan_sha256"] = "a" * 64
+        self.assertIs(self.load(d)["automerge"], True)
+        d = good()
+        d["automerge"] = False
+        self.assertIsNone(self.load(d)["plan_sha256"])   # без automerge пин необязателен, как раньше
+
+
 class TestRoles(LoaderBase):
     def test_extra_role(self):
         d = good()

@@ -1,5 +1,8 @@
 unbind-key -q -n BTab
-# C-\ открывает волну во всплывающем окне, если задан @wab_open, иначе отсоединяет / шлёт клавишу.
+# C-\ — открыть/закрыть окно текущей волны. Порядок проверок важен: сначала клиент с флагом
+# ignore-size (это attach внутри попапа wab-open) — detach-client закрывает попап; иначе, если задан
+# @wab_open, — попап с волной; иначе клавиша уходит в панель. Прежний порядок (@wab_open первым)
+# внутри попапа открывал ещё один попап вместо закрытия.
 # Контракт @wab_open: КОМАНДНАЯ СТРОКА, которую разбирает ровно один sh (sh -c). Путь с пробелами,
 # апострофом, $ или " пользователь заключает в кавычки сам, например:
 #   tmux set -g @wab_open '"/path/O'\''Brien/wab-open" /path/waves.json'
@@ -8,4 +11,4 @@ unbind-key -q -n BTab
 # Это точная инверсия: tmux превращает каждый «$» в «\$», так что литерал `\$` в значении приходит как `\\$`
 # и после sed снова равен `\$`. Проверено на tmux 3.4: show-options -gqv, display-message -p и #{q:} экранируют
 # одинаково (#{q:} ещё и удваивает «\»), способа читать без экранирования и без sed нет.
-bind-key -n "C-\\" if-shell -F "#{@wab_open}" { display-popup -E -w 95% -h 90% -T ' волна ' "exec sh -c \"\$(tmux show-options -gqv @wab_open | sed 's/[\\][\$]/\$/g')\"" } { if-shell -F "#{m:*ignore-size*,#{client_flags}}" { detach-client } { send-keys "C-\\" } }
+bind-key -n "C-\\" if-shell -F "#{m:*ignore-size*,#{client_flags}}" { detach-client } { if-shell -F "#{@wab_open}" { display-popup -E -w 95% -h 90% -T ' волна ' "exec sh -c \"\$(tmux show-options -gqv @wab_open | sed 's/[\\][\$]/\$/g')\"" } { send-keys "C-\\" } }
