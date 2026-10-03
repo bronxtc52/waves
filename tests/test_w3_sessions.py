@@ -234,7 +234,7 @@ class TestFindNewSession(_Tmp):
         self.assertIsNone(wab.find_new_session(self.cfg, st, "W1"))
 
 
-class TestTickAwaitSession(_Tmp):
+class _TickBase(_Tmp):
     def setUp(self):
         super().setUp()
         self.sent = []
@@ -259,6 +259,12 @@ class TestTickAwaitSession(_Tmp):
             self.assertTrue(wab.tick(self.cfg, st))
         return st["waves"]["W1"]
 
+    def events(self):
+        f = self.cfg["run_dir"] / "events.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+
+class TestTickAwaitSession(_TickBase):
     def test_binds_new_session_and_measures_it(self):
         self.journal("new", clear_scaffold() + [user(f"{MARK} продолжаем"), assistant(0, 0, 4000)], mtime=2000)
         w = self.tick(self.st())
@@ -283,10 +289,6 @@ class TestTickAwaitSession(_Tmp):
         self.assertEqual(self.sent, [])
 
     # --- G: у ожидания новой сессии есть срок (AWAIT_SESSION_MINUTES) ---
-    def events(self):
-        f = self.cfg["run_dir"] / "events.log"
-        return f.read_text(encoding="utf-8") if f.exists() else ""
-
     def test_await_timeout_one_event_no_phase_change(self):
         st = self.st(await_at=time.time() - (wab.AWAIT_SESSION_MINUTES + 1) * 60)
         w = self.tick(st)
@@ -314,6 +316,42 @@ class TestTickAwaitSession(_Tmp):
         w = self.tick(self.st())   # старое состояние без await_at: срок отсчитывается с этого тика
         self.assertIsInstance(w.get("await_at"), float)
         self.assertNotIn("не найдена по метке", self.events())
+
+
+class TestMigrateNoSessions(_TickBase):
+    """Запись волны до W3 (есть cwd, нет sessions): первый такт привязывает свободный журнал."""
+
+    def st(self, **extra):
+        st = super().st(**extra)
+        w = st["waves"]["W1"]
+        for k in ("sessions", "await_session", "tokens", "peak"):
+            w.pop(k, None)
+        return st
+
+    def test_binds_freshest_unowned_and_requests_checkpoint(self):
+        self.journal("older", [assistant(0, 0, 5)], mtime=500)
+        self.journal("fresh", [assistant(0, 0, self.cfg["ctx_limit"] + 7)], mtime=3000)   # старый "old" тоже свободен, но свежее этот
+        st = self.st()
+        st["waves"]["W2"] = {"tmux": "x", "cwd": self.cwd, "phase": "done", "notified": {}, "sessions": ["older"]}
+        w = self.tick(st)
+        self.assertEqual(w["sessions"], ["fresh"])
+        self.assertEqual(w["phase"], "checkpoint")
+        self.assertTrue(any("WAB-CHECKPOINT" in a[1] for a in self.sent), self.sent)
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["sessions"], ["fresh"])
+        self.assertEqual(self.events().count("запись без sessions (до W3): привязан журнал fresh как текущий"), 1)
+
+    def test_no_journals_one_event_and_keeps_trying(self):
+        for f in self.tdir.glob("*.jsonl"):
+            f.unlink()
+        st = self.st()
+        w = self.tick(st)
+        self.tick(st)
+        self.assertNotIn("sessions", w)
+        self.assertEqual(self.events().count("контекст не меряется: нет журнала"), 1)
+        self.journal("late", [assistant(0, 0, 9)], mtime=4000)
+        w = self.tick(st)
+        self.assertEqual(w["sessions"], ["late"])
+        self.assertEqual(w["tokens"], 9)
 
 
 class TestLaunchSession(unittest.TestCase):

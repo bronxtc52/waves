@@ -180,6 +180,27 @@ class TestPlanPin(_Base):
         self.assertIn("plan_sha256", err.getvalue())
 
 
+class TestPlanChangedDuringRoles(_Base):
+    def test_plan_edited_inside_ensure_roles_blocks_before_reserve(self):
+        (self.dir / "waves.md").write_text(PLAN, encoding="utf-8")
+        self.data["plan_sha256"] = PLAN_SHA
+        self.reload()
+        self.mocks()
+
+        def slow_roles(cfg, refresh=False):
+            (self.dir / "waves.md").write_text(PLAN + "правка во время проб\n", encoding="utf-8")
+            return dict(cfg["roles"]), {}
+
+        with mock.patch.object(wab, "ensure_roles", side_effect=slow_roles):
+            with self.assertRaises(SystemExit) as cm:
+                self.launch()
+        self.assertTrue(str(cm.exception).startswith("BLOCKED: plan changed since approval:"), str(cm.exception))
+        self.assertIsNone(wab.load_state(self.cfg).get("current"))
+        self.assertNotIn("W1", wab.load_state(self.cfg).get("waves", {}))
+        self.m["prepare_worktree"].assert_not_called()
+        self.assertEqual(self.sh_calls, [])
+
+
 class TestNewSessionFailure(_Base):
     def run_fail(self, exc):
         def sh(*a, **k):

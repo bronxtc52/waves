@@ -431,6 +431,24 @@ def owned_sessions(st):
     return owned
 
 
+def freshest_unowned_session(st, wave):
+    """Самый свежий журнал каталога рабочей копии волны, которым не владеет ни одна волна, или None.
+    Нужен миграции записи без sessions (создана до W3): метки в таком журнале может не быть."""
+    owned = owned_sessions(st)
+    d = transcript_dir(st["waves"][wave]["cwd"])
+    if not d.exists():
+        return None
+    files = []
+    for f in d.glob("*.jsonl"):
+        if f.stem in owned:
+            continue
+        try:
+            files.append((f.stat().st_mtime, f.stem))
+        except OSError:
+            continue
+    return max(files)[1] if files else None
+
+
 def find_new_session(cfg, st, wave):
     """После /clear волна продолжается в новом файле журнала. Ищем его по метке в первом настоящем
     сообщении среди журналов этой рабочей копии, которых ещё нет ни у одной волны; свежие первыми."""
@@ -815,7 +833,7 @@ def launch(cfg, wave, prompt_file):
     if not prompt:
         raise SystemExit(f"файл промпта {prompt_file} пустой")
     require_tmux()   # до worktree и резерва: старый tmux не должен оставить после себя следов
-    check_plan(cfg)
+    check_plan(cfg)  # дешёвая проверка раньше проб моделей; окончательная — под блокировкой перед резервом
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     # дешёвая предварительная проверка — до платных проверок моделей; окончательная — под резервом ниже
     with run_lock(cfg):
@@ -827,6 +845,7 @@ def launch(cfg, wave, prompt_file):
     # проверка и резерв — одним шагом под блокировкой прогона: иначе два координатора при
     # пустом current оба пройдут проверку и запустят две волны, а current достанется последней
     with run_lock(cfg):
+        check_plan(cfg)  # ensure_roles шёл минутами: waves.md мог измениться после первой проверки
         st = load_state(cfg)
         cur, prev_rec = _check_launchable(cfg, st, wave, name)
         # резерв до worktree и tmux: параллельный launch увидит волну, а watch — её запись
@@ -1277,6 +1296,18 @@ def tick(cfg, st, waves_json=None):
         w["notified"].pop("blocked", None)  # будущий BLOCKED снова сообщится
         event(cfg, f"{wave}: восстановлена вручную, слежу дальше")
         save_state(cfg, st)
+
+    if "sessions" not in w and w.get("cwd"):
+        # запись, созданная до W3 (watch перезапущен на идущей волне): без sessions контекст не мерился бы
+        # никогда. Привязываем самый свежий журнал, которым не владеет ни одна волна, и сохраняем до действий.
+        sid = freshest_unowned_session(st, wave)
+        if sid:
+            w["sessions"] = [sid]
+            event(cfg, f"{wave}: запись без sessions (до W3): привязан журнал {sid} как текущий")
+            save_state(cfg, st)
+        elif once_per(w, "no_journal", "migrate"):
+            event(cfg, f"{wave}: контекст не меряется: нет журнала в каталоге рабочей копии")
+            save_state(cfg, st)
 
     txt = pane_text(name)
     awaiting = bool(w.get("await_session"))
