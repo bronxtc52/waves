@@ -768,10 +768,17 @@ def _check_launchable(cfg, st, wave, name):
                     f"wab.py launch <waves.json> {shlex.quote(str(cur))} <файл-промпта>")
         raise SystemExit(msg)
     prev_rec = (st.get("waves") or {}).get(wave)
-    if cur == wave and (prev_rec or {}).get("phase") == "starting" and _pid_alive(prev_rec.get("launcher_pid")):
+    if cur == wave and (prev_rec or {}).get("phase") in ("starting", "sending") \
+            and _pid_alive(prev_rec.get("launcher_pid")):
         raise SystemExit(f"волна {wave} уже запускается другим wab.py (pid {prev_rec['launcher_pid']}); "
                          f"дождитесь его завершения")
     if tmux_alive(name):
+        if cur == wave and (prev_rec or {}).get("phase") == "sending" \
+                and not _pid_alive((prev_rec or {}).get("launcher_pid")):
+            # задача могла дойти: kill-session уничтожил бы незакоммиченную работу агента
+            raise SystemExit(f"tmux-сессия {name} уже существует: прошлый launch прерван при отправке "
+                             f"задачи. Не закрывайте её: посмотрите окно (tmux attach -t ={name}); "
+                             f"если задачи там нет — отправьте текст из first-prompt.md")
         if cur == wave and (prev_rec or {}).get("phase") in ("starting", "not_ready") \
                 and not _pid_alive((prev_rec or {}).get("launcher_pid")):
             raise SystemExit(f"tmux-сессия {name} уже существует: прошлый launch прерван до отправки "
@@ -887,6 +894,8 @@ def launch(cfg, wave, prompt_file):
     head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
             f"Рабочая копия (git worktree): {cwd}. Протокол — в системной инструкции.\n\n")
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
+    # окно доставки явное: убитый здесь launch неотличим от «задача дошла», tick разбирает это по журналу
+    _update_wave(cfg, wave, phase="sending")
     send_text(name, head + prompt)
     _update_wave(cfg, wave, phase="running")
     event(cfg, f"{wave}: запущена в tmux {name}", trusted=f", cwd {cwd}")
@@ -1150,7 +1159,7 @@ def tick(cfg, st, waves_json=None):
     if not wave:
         return False
     w = st["waves"][wave]
-    if w.get("phase") == "starting" and _pid_alive(w.get("launcher_pid")):
+    if w.get("phase") in ("starting", "sending") and _pid_alive(w.get("launcher_pid")):
         return True  # launch ещё создаёт worktree и сессию: не считать её мёртвой, ждать
     name, wdir = w["tmux"], wave_dir(cfg, wave)
     status = read(wdir / "status")
@@ -1195,6 +1204,26 @@ def tick(cfg, st, waves_json=None):
         w["phase"] = "dead"
         save_state(cfg, st)
         return False  # цепочка стоит: перезапустить волну руками и снова запустить watch
+
+    if w.get("phase") == "sending":
+        # launch убит после начала отправки первого промпта: задача могла дойти. Решает журнал сессии:
+        # метка волны в первом настоящем сообщении = дошла. Иначе — владелец, без совета убивать окно.
+        sid0 = (w.get("sessions") or [None])[0]
+        jf = transcript_dir(w["cwd"]) / f"{sid0}.jsonl" if sid0 and w.get("cwd") else None
+        w.pop("launcher_pid", None)
+        if jf is not None and jf.exists() and session_marker(cfg, wave) in _first_user_text(jf):
+            w["phase"] = "running"
+            event(cfg, f"{wave}: launch прерван после доставки, слежу дальше")
+            save_state(cfg, st)
+            return True
+        msg = (f"BLOCKED: launch прерван при отправке задачи; проверьте окно (tmux attach -t ={name}): "
+               f"если задачи нет — отправьте текст из {wdir / 'first-prompt.md'}")
+        w["phase"] = "not_ready"
+        w["notified"]["blocked"] = msg
+        (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        event(cfg, f"{wave}: {msg}")
+        save_state(cfg, st)
+        return True
 
     if w.get("phase") == "starting":
         # сюда попадаем, только если launcher_pid мёртв (иначе вернулись выше): launch убит после

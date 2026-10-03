@@ -223,7 +223,7 @@ class TestNewSessionFailure(_Base):
         self.assertIn("tmux", msg)
 
 
-class TestInterruptedLaunch(_Base):
+class _InterruptedBase(_Base):
     def setUp(self):
         super().setUp()
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -244,6 +244,8 @@ class TestInterruptedLaunch(_Base):
         with contextlib.redirect_stdout(io.StringIO()):
             return wab.tick(self.cfg, self.st)
 
+
+class TestInterruptedLaunch(_InterruptedBase):
     def test_window_alive_blocked_once(self):
         self.assertTrue(self.tick())
         w = self.st["waves"]["W1"]
@@ -274,6 +276,95 @@ class TestInterruptedLaunch(_Base):
         with self.assertRaises(SystemExit) as cm:
             wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
         self.assertIn("kill-session", str(cm.exception))
+
+
+class TestSendingWindow(_InterruptedBase):
+    """launch убит между send_text первого промпта и phase=running: окно доставки неоднозначно."""
+
+    def setUp(self):
+        super().setUp()
+        self.projects = self.dir / "projects"
+        self.projects.mkdir()
+        pt = mock.patch.object(wab, "PROJECTS", self.projects)
+        pt.start()
+        self.addCleanup(pt.stop)
+        self.st["waves"]["W1"]["phase"] = "sending"
+
+    def journal(self, first_text):
+        d = wab.transcript_dir(self.st["waves"]["W1"]["cwd"])
+        d.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"type": "user", "message": {"role": "user", "content": first_text}}, ensure_ascii=False)
+        (d / "s.jsonl").write_text(line + "\n", encoding="utf-8")
+
+    def test_marker_in_journal_means_delivered(self):
+        self.journal(f"{wab.session_marker(self.cfg, 'W1')} Волна W1. задача")
+        self.assertTrue(self.tick())
+        self.assertTrue(self.tick())
+        w = self.st["waves"]["W1"]
+        self.assertEqual(w["phase"], "running")
+        self.assertNotIn("launcher_pid", w)
+        self.assertEqual(self.log().count("launch прерван после доставки, слежу дальше"), 1)
+        self.assertNotIn("kill-session", self.log())
+
+    def test_no_marker_blocked_without_kill_advice(self):
+        self.journal("совсем другое сообщение")
+        self.assertTrue(self.tick())
+        self.assertTrue(self.tick())
+        w = self.st["waves"]["W1"]
+        self.assertEqual(w["phase"], "not_ready")
+        status = (wab.wave_path(self.cfg, "W1") / "status").read_text(encoding="utf-8")
+        self.assertTrue(status.startswith("BLOCKED: launch прерван при отправке задачи"), status)
+        self.assertIn("first-prompt.md", status)
+        self.assertNotIn("kill-session", status + self.log())
+        self.assertIn("tmux attach -t =wab-demo-w1", self.log())
+        self.assertEqual(self.log().count("launch прерван при отправке"), 1)
+
+    def test_no_journal_blocked(self):
+        self.assertTrue(self.tick())
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "not_ready")
+
+    def test_live_launcher_in_sending_is_waited_for(self):
+        self.st["waves"]["W1"]["launcher_pid"] = os.getpid()
+        self.assertTrue(self.tick())
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "sending")
+
+    def test_check_launchable_in_sending_has_no_kill_advice(self):
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        msg = str(cm.exception)
+        self.assertNotIn("kill-session", msg)
+        self.assertIn("tmux attach -t =wab-demo-w1", msg)
+        self.assertIn("first-prompt.md", msg)
+
+    def test_starting_unchanged(self):
+        self.st["waves"]["W1"]["phase"] = "starting"
+        self.assertTrue(self.tick())
+        status = (wab.wave_path(self.cfg, "W1") / "status").read_text(encoding="utf-8")
+        self.assertIn("kill-session", status)
+
+
+class TestLaunchSendingPhase(_Base):
+    def test_sending_saved_and_first_prompt_written_before_send_text(self):
+        seen = {}
+
+        def fake_send(name, text):
+            seen["phase"] = wab.load_state(self.cfg)["waves"]["W1"]["phase"]
+            seen["file"] = (wab.wave_path(self.cfg, "W1") / "first-prompt.md").exists()
+
+        pt = helpers.stub_ensure_roles(wab)
+        pt.start()
+        self.addCleanup(pt.stop)
+        for name, kw in {"tmux_alive": {"return_value": False},
+                         "prepare_worktree": {"return_value": str(self.dir / "wt")},
+                         "sh": {"return_value": None}, "wait_ready": {"return_value": True},
+                         "send_text": {"side_effect": fake_send}}.items():
+            p = mock.patch.object(wab, name, **kw)
+            p.start()
+            self.addCleanup(p.stop)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(wab.launch(self.cfg, "W1", str(self.prompt)))
+        self.assertEqual(seen, {"phase": "sending", "file": True})
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "running")
 
 
 class TestDispatcherLock(_Base):
