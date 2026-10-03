@@ -562,7 +562,8 @@ class TestNoPinNoAutolaunch(_Flow):
         self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
         log = self.log()
         self.assertIn("W1 смержена; нет plan_sha256 — следующую волну W2 запустите вручную", log)
-        self.assertIn(f"wab.py launch {self.cfg_path} W2 {wdir / 'next-prompt.md'}", log)
+        # _watch_loop передаёт разрешённый путь waves.json (macOS: /var → /private/var), next-prompt — как есть
+        self.assertIn(f"wab.py launch {pathlib.Path(self.cfg_path).resolve()} W2 {wdir / 'next-prompt.md'}", log)
         self.assertIn("watch остановлен", log)
         self.assertIn(("wab-demo-w1", "-l", "/exit"), self.keys)
 
