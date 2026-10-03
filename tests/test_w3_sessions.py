@@ -318,6 +318,10 @@ class TestTickAwaitSession(_TickBase):
         self.assertNotIn("не найдена по метке", self.events())
 
 
+LEGACY_EVENT = ("запись до W3: контекст меряется по самому свежему журналу каталога, как до W3; "
+                "точная привязка — после следующего /clear")
+
+
 class TestMigrateNoSessions(_TickBase):
     """Запись волны до W3 (есть cwd, нет sessions): первый такт привязывает свободный журнал."""
 
@@ -334,11 +338,30 @@ class TestMigrateNoSessions(_TickBase):
         st = self.st()
         st["waves"]["W2"] = {"tmux": "x", "cwd": self.cwd, "phase": "done", "notified": {}, "sessions": ["older"]}
         w = self.tick(st)
-        self.assertEqual(w["sessions"], ["fresh"])
+        self.assertNotIn("sessions", w)   # выбор не сохраняется
         self.assertEqual(w["phase"], "checkpoint")
         self.assertTrue(any("WAB-CHECKPOINT" in a[1] for a in self.sent), self.sent)
-        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["sessions"], ["fresh"])
-        self.assertEqual(self.events().count("запись без sessions (до W3): привязан журнал fresh как текущий"), 1)
+        self.assertNotIn("sessions", wab.load_state(self.cfg)["waves"]["W1"])
+        self.assertEqual(self.events().count(LEGACY_EVENT), 1)
+
+    def test_fresher_journal_replaces_choice(self):
+        self.journal("a", [assistant(0, 0, 5)], mtime=1500)
+        st = self.st()
+        w = self.tick(st)
+        self.assertEqual(w["tokens"], 5)
+        self.journal("b", [assistant(0, 0, 77)], mtime=2500)
+        w = self.tick(st)
+        self.assertEqual(w["tokens"], 77)
+        self.assertNotIn("sessions", w)
+        self.assertEqual(self.events().count(LEGACY_EVENT), 1)   # одно событие, не на каждый такт
+
+    def test_journal_owned_by_other_wave_not_measured(self):
+        self.journal("mine", [assistant(0, 0, 5)], mtime=2000)
+        self.journal("alien", [assistant(0, 0, 999)], mtime=3000)
+        st = self.st()
+        st["waves"]["W2"] = {"tmux": "x", "cwd": self.cwd, "phase": "done", "notified": {}, "sessions": ["alien", "old"]}
+        w = self.tick(st)
+        self.assertEqual(w["tokens"], 5)
 
     def test_no_journals_one_event_and_keeps_trying(self):
         for f in self.tdir.glob("*.jsonl"):
@@ -350,7 +373,7 @@ class TestMigrateNoSessions(_TickBase):
         self.assertEqual(self.events().count("контекст не меряется: нет журнала"), 1)
         self.journal("late", [assistant(0, 0, 9)], mtime=4000)
         w = self.tick(st)
-        self.assertEqual(w["sessions"], ["late"])
+        self.assertNotIn("sessions", w)
         self.assertEqual(w["tokens"], 9)
 
 
@@ -422,8 +445,9 @@ class TestAwaitBeatsMigration(_TickBase):
     def test_migration_without_await_still_works(self):
         self.journal("fresh", [assistant(0, 0, 11)], mtime=5000)
         w = self.tick_status(self.st(), "RUNNING")
-        self.assertEqual((w["sessions"], w["tokens"]), (["fresh"], 11))
-        self.assertIn("запись без sessions (до W3): привязан журнал fresh как текущий", self.events())
+        self.assertEqual(w["tokens"], 11)
+        self.assertNotIn("sessions", w)
+        self.assertIn(LEGACY_EVENT, self.events())
 
 
 class TestLaunchSession(unittest.TestCase):

@@ -1336,16 +1336,19 @@ def tick(cfg, st, waves_json=None):
         event(cfg, f"{wave}: восстановлена вручную, слежу дальше")
         save_state(cfg, st)
 
+    legacy_sid = None
     if "sessions" not in w and w.get("cwd") and not w.get("await_session"):
-        # запись, созданная до W3 (watch перезапущен на идущей волне): без sessions контекст не мерился бы
-        # никогда. Привязываем самый свежий журнал, которым не владеет ни одна волна, и сохраняем до действий.
-        # Пока стоит await_session, новый журнал привязывает только find_new_session (по метке, со снятием
-        # флага): миграция забрала бы его в sessions, и флаг остался бы навсегда.
-        sid = freshest_unowned_session(st, wave)
-        if sid:
-            w["sessions"] = [sid]
-            event(cfg, f"{wave}: запись без sessions (до W3): привязан журнал {sid} как текущий")
-            save_state(cfg, st)
+        # запись, созданная до W3 (watch перезапущен на идущей волне). Выбор журнала НЕ сохраняем: самый
+        # свежий журнал каталога мог оказаться чужой сессией Claude в той же рабочей копии, и сохранённая
+        # ошибка не исправилась бы. Каждый такт меряем самый свежий журнал без владельца, как до W3;
+        # точная привязка — по метке после следующего /clear. Пока стоит await_session, журнал привязывает
+        # только find_new_session (по метке, со снятием флага).
+        legacy_sid = freshest_unowned_session(st, wave)
+        if legacy_sid:
+            if once_per(w, "legacy_session", "1"):
+                event(cfg, f"{wave}: запись до W3: контекст меряется по самому свежему журналу каталога, "
+                           f"как до W3; точная привязка — после следующего /clear")
+                save_state(cfg, st)
         elif once_per(w, "no_journal", "migrate"):
             event(cfg, f"{wave}: контекст не меряется: нет журнала в каталоге рабочей копии")
             save_state(cfg, st)
@@ -1371,7 +1374,10 @@ def tick(cfg, st, waves_json=None):
     if awaiting:
         tokens = w.get("tokens", 0)  # старый журнал не меряем: контрольную точку не запрашиваем
     else:
-        tokens = context_tokens(w)
+        if legacy_sid:
+            tokens = CACHE.read(transcript_path(w["cwd"], legacy_sid))["ctx"]
+        else:
+            tokens = context_tokens(w)
         w["tokens"] = tokens
         w["peak"] = max(w.get("peak", 0), tokens)
         w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
