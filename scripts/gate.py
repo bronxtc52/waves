@@ -221,8 +221,10 @@ def collect_facts(cfg, branch, cwd, run=default_run, base="main"):
     """Все факты для decide. Пин плана сверяется при КАЖДОМ сборе: план мог смениться посреди волны.
 
     Ключи: pr (dict|None), duplicate (текст|None), local_head, tree_clean, checks (список|None —
-    PR нет, закрыт или смержен: для MERGED check-runs не нужны), plan (None|причина), errors.
-    Для MERGED локальные факты (HEAD, дерево) не собираются: local_head и tree_clean остаются None.
+    PR нет или закрыт без мерджа), plan (None|причина), errors.
+    Для MERGED check-runs собираются на финальном headRefOid смерженного PR (его могли смержить
+    вручную раньше первого опроса или после смены HEAD), а локальные факты (HEAD, дерево) — нет:
+    local_head и tree_clean остаются None.
     """
     facts = {"pr": None, "duplicate": None, "local_head": None, "tree_clean": None, "checks": None,
              "plan": plan_problem(cfg), "errors": []}
@@ -235,7 +237,13 @@ def collect_facts(cfg, branch, cwd, run=default_run, base="main"):
     p = facts["pr"]
     if p and p.get("state") == "MERGED":
         # смержено на GitHub: HEAD и дерево рабочей копии волны уже ничего не решают, а сломанный
-        # локальный git не должен держать волну в wait (пин плана выше при этом в силе)
+        # локальный git не должен держать волну в wait (пин плана выше при этом в силе). Но финальный
+        # HEAD обязан быть зелёным: ручной мердж непроверенного HEAD не пускает следующую волну
+        if p.get("headRefOid"):
+            try:
+                facts["checks"] = check_runs(cfg["repo"], p["headRefOid"], run)
+            except GateError as e:
+                facts["errors"].append(str(e))
         return facts
     try:
         facts["local_head"], facts["tree_clean"] = local_facts(cwd, run)
@@ -266,11 +274,35 @@ def decide(facts):
         fails.append(facts["duplicate"])
     p = facts.get("pr")
     merged = False
+
+    def judge(checks, sha):
+        """(не завершены, не success) по check-runs; 0 run'ов — тоже «ждать»."""
+        if not checks:
+            waits.append(f"нет check-runs на {sha[:12]}")
+        pending = [c["name"] for c in checks if c.get("status") != "completed"]
+        bad = [f"{c['name']}={c.get('conclusion')}" for c in checks
+               if c.get("status") == "completed" and c.get("conclusion") != "success"]
+        if pending:
+            more = f" и ещё {len(pending) - NAMES_LIMIT}" if len(pending) > NAMES_LIMIT else ""
+            waits.append("check-runs не завершены: " + ", ".join(pending[:NAMES_LIMIT]) + more)
+        if bad:
+            more = f" и ещё {len(bad) - NAMES_LIMIT}" if len(bad) > NAMES_LIMIT else ""
+            return ", ".join(bad[:NAMES_LIMIT]) + more
+        return None
+
     if p is None:
         if not facts.get("duplicate") and not facts.get("errors"):
             waits.append("PR ветки не найден")
     elif p.get("state") == "MERGED":
         merged = True
+        sha, checks = p.get("headRefOid") or "", facts.get("checks")
+        if checks is None:
+            if not facts.get("errors"):
+                waits.append(f"check-runs смерженного PR #{p.get('number')} не собраны")
+        else:
+            bad = judge(checks, sha)
+            if bad:
+                fails.append(f"PR #{p.get('number')} смержен, но check-runs на {sha[:12]} не зелёные: {bad}")
     elif p.get("state") != "OPEN":
         fails.append(f"PR #{p.get('number')} закрыт без мерджа")
     else:
@@ -281,17 +313,9 @@ def decide(facts):
             waits.append(f"HEAD волны {head[:12]} ≠ headRefOid PR {want[:12]} (push не дошёл или HEAD сменился)")
         checks = facts.get("checks")
         if checks is not None:
-            if not checks:
-                waits.append(f"нет check-runs на {want[:12]}")
-            pending = [c["name"] for c in checks if c.get("status") != "completed"]
-            bad = [f"{c['name']}={c.get('conclusion')}" for c in checks
-                   if c.get("status") == "completed" and c.get("conclusion") != "success"]
-            if pending:
-                more = f" и ещё {len(pending) - NAMES_LIMIT}" if len(pending) > NAMES_LIMIT else ""
-                waits.append("check-runs не завершены: " + ", ".join(pending[:NAMES_LIMIT]) + more)
+            bad = judge(checks, want)
             if bad:
-                more = f" и ещё {len(bad) - NAMES_LIMIT}" if len(bad) > NAMES_LIMIT else ""
-                fails.append("check-runs не успешны: " + ", ".join(bad[:NAMES_LIMIT]) + more)
+                fails.append("check-runs не успешны: " + bad)
     if fails:
         return "fail", fails
     if waits:

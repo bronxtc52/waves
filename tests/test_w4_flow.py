@@ -382,6 +382,68 @@ class TestRedactBeforeCut(_Flow):
         self.assertEqual(leaks(self.everywhere()), [])
 
 
+class TestMergedChecks(_Flow):
+    """PR смержен вручную: финальный HEAD всё равно проходит check-runs строго (Codex P1)."""
+
+    def run_watch(self):
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(wab.time, "sleep"):
+            wab._watch_loop(self.cfg, str(self.cfg_path))
+
+    def test_merged_with_red_final_head_blocks(self):
+        self.gh.state, self.gh.head = "MERGED", OTHER
+        self.gh.runs = [{"name": "tests", "status": "completed", "conclusion": "failure"}]
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text("DONE\n", encoding="utf-8")
+        (wdir / "next-prompt.md").write_text("дальше\n", encoding="utf-8")
+        wab.save_state(self.cfg, self.st)
+        with helpers.deadline(10):
+            self.alive = False   # после BLOCKED окно мертво — watch остановится, а не будет ждать вечно
+            self.run_watch()
+        self.assertEqual(self.status(), f"BLOCKED: merge gate: PR #7 смержен, но check-runs на {OTHER[:12]} "
+                                        f"не зелёные: tests=failure")
+        self.m_launch.assert_not_called()
+        saved = wab.load_state(self.cfg)
+        self.assertNotIn("pending_launch", saved)
+        self.assertNotIn("merged", saved["waves"]["W1"])
+        api = [c for c in self.gh.calls if c[:2] == ["gh", "api"]]
+        self.assertTrue(api and all(OTHER in c[-1] for c in api))
+
+    def test_head_changed_then_merged_pending_then_green_launches_once(self):
+        self.assertTrue(self.tick("DONE"))
+        self.assertEqual(self.w()["phase"], "awaiting_merge")
+        self.assertEqual(self.w()["pr"]["sha"], SHA)
+        # между опросами в PR пришёл новый HEAD, и человек смержил его, пока CI ещё идёт
+        self.gh.state, self.gh.head = "MERGED", OTHER
+        self.gh.runs = [{"name": "ci", "status": "in_progress", "conclusion": None}]
+        self.assertTrue(self.tick())
+        self.assertEqual(self.w()["gate"]["verdict"], "wait")
+        self.assertNotIn("merged", self.w())
+        self.assertNotIn("pending_launch", self.st)
+        self.assertEqual(self.keys, [])
+        # CI финального HEAD позеленел
+        self.gh.runs = [{"name": "ci", "status": "completed", "conclusion": "success"}]
+        wab.save_state(self.cfg, self.st)
+        launched = []
+
+        def reserve(cfg, wave, prompt):
+            launched.append(wave)
+            with wab.run_lock(cfg):
+                st = wab.load_state(cfg)
+                st.pop("pending_launch", None)
+                st["current"] = wave
+                st["waves"][wave] = {"tmux": "wab-demo-w2", "cwd": None, "phase": "running",
+                                     "restarts": 0, "notified": {}, "started": 1.0}
+                wab.save_state(cfg, st)
+            self.alive = False
+            return True
+        self.m_launch.side_effect = reserve
+        self.run_watch()
+        self.assertEqual(launched, ["W2"])
+        saved = wab.load_state(self.cfg)
+        self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
+        self.assertEqual(saved["waves"]["W1"]["pr"]["sha"], OTHER)
+
+
 class TestMergeVerify(_Flow):
     def test_not_ancestor_blocks_and_retries(self):
         self.gh.state, self.gh.ancestor = "MERGED", 1

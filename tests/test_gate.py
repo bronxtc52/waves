@@ -220,7 +220,10 @@ class TestFindPr(_Cfg):
         verdict, _ = self.gate(fake)
         self.assertEqual(verdict, "merged")
         self.assertEqual(gate.find_pr(REPO, "b", "main", FakeRun(prs=prs))["number"], 5)
-        self.assertFalse([c for c in fake.calls if c[:2] == ["gh", "api"]], "для MERGED check-runs не нужны")
+        # для MERGED check-runs собираются на финальном headRefOid смерженного PR
+        api = [c for c in fake.calls if c[:2] == ["gh", "api"]]
+        self.assertEqual(len(api), 1)
+        self.assertIn(f"repos/{REPO}/commits/{SHA}/check-runs?per_page=100", api[0])
 
     def test_merged_ignores_local_git_errors(self):
         # для MERGED локальные факты не нужны: сломанный git рабочей копии не превращает merged в wait
@@ -230,6 +233,38 @@ class TestFindPr(_Cfg):
         verdict, reasons = self.gate(fake)
         self.assertEqual(verdict, "merged", reasons)
         self.assertFalse([c for c in fake.calls if c[:1] == ["git"]], "git для MERGED не вызывается")
+
+    def merged(self, pages=None, overrides=None, head=SHA):
+        return self.gate(FakeRun(prs=[pr(5, "MERGED", head=head, merged_at="2026-10-02T00:00:00Z")],
+                                 pages=pages, overrides=overrides))
+
+    def test_merged_red_checks_fail(self):
+        verdict, reasons = self.merged(pages=[page([run_("ci"), run_("tests", conclusion="failure")])], head=OTHER)
+        self.assertEqual(verdict, "fail")
+        self.assertIn(f"PR #5 смержен, но check-runs на {OTHER[:12]} не зелёные: tests=failure", reasons)
+
+    def test_merged_skipped_is_not_green(self):
+        verdict, _ = self.merged(pages=[page([run_("x", conclusion="skipped")])])
+        self.assertEqual(verdict, "fail")
+
+    def test_merged_pending_or_none_wait(self):
+        self.assertEqual(self.merged(pages=[page([run_("ci", "in_progress", None)])])[0], "wait")
+        verdict, reasons = self.merged(pages=[page([])])
+        self.assertEqual(verdict, "wait")
+        self.assertIn("нет check-runs", " ".join(reasons))
+
+    def test_merged_checks_error_wait(self):
+        verdict, _ = self.merged(overrides={("gh", "api"): (1, "", "HTTP 502")})
+        self.assertEqual(verdict, "wait")
+        verdict, _ = self.merged(pages=[page([run_("a")], total=3)])
+        self.assertEqual(verdict, "wait")
+
+    def test_merged_pure_decide_requires_checks(self):
+        merged_pr = pr(5, "MERGED", merged_at="2026-10-02T00:00:00Z")
+        base = {"pr": merged_pr, "local_head": None, "tree_clean": None, "plan": None, "errors": [],
+                "duplicate": None}
+        self.assertEqual(gate.decide({**base, "checks": [run_("ci")]})[0], "merged")
+        self.assertEqual(gate.decide({**base, "checks": None})[0], "wait")
 
     def test_merged_plan_still_fails(self):
         self.pin(b"plan v1\n", file_text=b"x")
