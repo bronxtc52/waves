@@ -455,6 +455,18 @@ class TestDocs(unittest.TestCase):
             self.assertIn(s, t)
         self.assertIn("SKILL.md", (ROOT / "README.md").read_text(encoding="utf-8"))
 
+    def test_skill_commands_use_skill_dir(self):
+        """Скилл зовут из целевого репо: относительный scripts/ там не найдётся."""
+        import re
+        t = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn('WAB="${WAB:-$HOME/.claude/skills/wave-autobot}"', t)
+        cmds = [ln for ln in t.splitlines() if "python3" in ln]
+        self.assertTrue(cmds)
+        for ln in cmds:
+            self.assertIsNone(re.search(r"python3\s+(?:\./)?scripts/", ln), f"относительный путь: {ln}")
+            if re.search(r"\b(wab|dash)\.py\b", ln):
+                self.assertIn('python3 "$WAB"/scripts/', ln, f"команда без $WAB: {ln}")
+
 
 if __name__ == "__main__":
     unittest.main()

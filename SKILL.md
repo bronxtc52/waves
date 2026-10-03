@@ -10,10 +10,24 @@ description: Большую задачу режет на волны (кажда�
 `scripts/dash.py` показывает ход. Роли: архитектор планирует, кодер пишет, тестер и ревьюер
 проверяют (субагенты волны), читатель разбирает большие файлы — каждая на своей модели из `roles`.
 
+## Каталог скилла
+
+Скилл вызывают из целевого репозитория, поэтому `scripts/` относительно текущего каталога не
+найдётся. Все команды ниже берут скрипты из каталога скилла через переменную `WAB`:
+
+```
+WAB="${WAB:-$HOME/.claude/skills/wave-autobot}"
+```
+
+Это каталог, куда `install.sh` ставит скилл симлинком. Если скилл лежит в другом месте, задай
+`WAB` равным каталогу, который Claude Code показывает как «Base directory for this skill» при
+загрузке скилла. Файлы `waves.json`, `waves.md` и `prompt-W1.md` — файлы пользователя: они лежат в
+текущем каталоге целевого репозитория, пути к ним относительные.
+
 ## Фаза A — план (архитектор, вместе с человеком)
 
 Фазу A запускай на модели **`roles.architect`**: `claude --model <architect>` (по умолчанию `fable`;
-значение смотри в `waves.json` или командой `python3 scripts/wab.py models waves.json`).
+значение смотри в `waves.json` или командой `python3 "$WAB"/scripts/wab.py models waves.json`).
 
 1. **Короткое ТЗ с человеком:** проблема, что делаем и чего не делаем, приёмка.
 2. **План `waves.md`** по шаблону:
@@ -34,13 +48,13 @@ description: Большую задачу режет на волны (кажда�
    (architect, coder, tester, reviewer, reader), `fallback_model`, `base_branch`, `automerge`,
    `ctx_limit`, `idle_minutes`, `tick_seconds`, `plan_sha256`. В `plan_sha256` — sha256
    одобренного `waves.md` (`sha256sum waves.md`). Проверка:
-   `python3 scripts/wab.py validate waves.json`.
+   `python3 "$WAB"/scripts/wab.py validate waves.json`.
 5. **Запуск:**
-   - `python3 scripts/wab.py models waves.json` — проверить доступность моделей ролей
+   - `python3 "$WAB"/scripts/wab.py models waves.json` — проверить доступность моделей ролей
      (недоступная заменяется на `fallback_model`; `--refresh` проверяет заново);
-   - `python3 scripts/wab.py launch waves.json W1 prompt-W1.md` — запустить волну;
-   - `python3 scripts/wab.py watch waves.json` — следить до `DONE`;
-   - `python3 scripts/dash.py waves.json` — дашборд, в отдельном окне tmux.
+   - `python3 "$WAB"/scripts/wab.py launch waves.json W1 prompt-W1.md` — запустить волну;
+   - `python3 "$WAB"/scripts/wab.py watch waves.json` — следить до `DONE`;
+   - `python3 "$WAB"/scripts/dash.py waves.json` — дашборд, в отдельном окне tmux.
 
 ## Фаза B — ход волн
 
