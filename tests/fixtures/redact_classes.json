@@ -1,0 +1,154 @@
+{
+ "json_in_string": [
+  {
+   "text": "{\\\"password\\\": \\\"Hunter2Secret\\\"}",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "cmd output: {\\\"user\\\": \\\"bob\\\", \\\"token\\\": \\\"abc123XYZ\\\", \\\"n\\\": 1}",
+   "secret": "abc123XYZ"
+  },
+  {
+   "text": "{\\\"api_key\\\":\\\"Zk91Qw\\\"}",
+   "secret": "Zk91Qw"
+  }
+ ],
+ "escaped_quote_in_value": [
+  {
+   "text": "{\"password\": \"pa\\\"ssWordTail\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "{'token': 'to\\'kenTail'}",
+   "secret": "kenTail"
+  },
+  {
+   "text": "password=\"a\\\"b c\\\"dTail\" next",
+   "secret": "dTail"
+  }
+ ],
+ "compound_names": [
+  {
+   "text": "SECRET_KEY=Hunter2Secret",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENG",
+   "secret": "wJalrXUtnFEMIK7MDENG"
+  },
+  {
+   "text": "{\"private_key\": \"MIIEvQIBADAN\"}",
+   "secret": "MIIEvQIBADAN"
+  },
+  {
+   "text": "private_key: MIIEvQIBADAN",
+   "secret": "MIIEvQIBADAN"
+  },
+  {
+   "text": "passphrase = \"correct horse\"",
+   "secret": "correct horse"
+  },
+  {
+   "text": "{\"password_hash\": \"5f4dcc3b5aa7\"}",
+   "secret": "5f4dcc3b5aa7"
+  },
+  {
+   "text": "DB_PASSWORD=Hunter2Secret",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "x-api-key: Hunter2Secret",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "client_secret=Hunter2Secret",
+   "secret": "Hunter2Secret"
+  }
+ ],
+ "php_arrow": [
+  {
+   "text": "'password' => 'Hunter2Secret',",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "\"token\"=>\"abc123XYZ\"",
+   "secret": "abc123XYZ"
+  },
+  {
+   "text": "$cfg = ['secret' => 'Hunter2 Secret', 'debug' => true];",
+   "secret": "Hunter2"
+  }
+ ],
+ "cli_flags": [
+  {
+   "text": "mysql --user bob --password Hunter2Secret --host db",
+   "secret": "Hunter2Secret"
+  },
+  {
+   "text": "tool --token=abc123XYZ run",
+   "secret": "abc123XYZ"
+  },
+  {
+   "text": "tool --password \"Hunter2 Secret\" run",
+   "secret": "Hunter2"
+  },
+  {
+   "text": "curl --api-key Zk91QwTail https://x",
+   "secret": "Zk91QwTail"
+  },
+  {
+   "text": "tool --passphrase 'correct horse' go",
+   "secret": "correct horse"
+  }
+ ],
+ "email": [
+  {
+   "text": "пишите на ivan.petrov+wab@example.co.uk срочно",
+   "secret": "ivan.petrov"
+  },
+  {
+   "text": "mail:a_b-c@mail.example.com;",
+   "secret": "a_b-c"
+  }
+ ],
+ "plain": [
+  "task-implementing-features",
+  "token budget",
+  "Контекст волны вырос, нужна контрольная точка и продолжение после очистки",
+  "secret handshake done",
+  "max_tokens: 5 и tokens: 12",
+  "tool --token-budget 5 --password-file /tmp/x --no-secret-scan",
+  "see user@ for details and a @ b",
+  "подсказка: пароль хранится в хранилище"
+ ],
+ "escape_levels": [
+  {
+   "text": "{\\\"password\\\": \\\"pa\\\\\\\"ssWordTail\\\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "x {\\\"user\\\": \\\"bob\\\", \\\"token\\\": \\\"to\\\\\\\"kenTail\\\", \\\"n\\\": 1}",
+   "secret": "kenTail"
+  },
+  {
+   "text": "{\"password\": \"pa\\\"ssWordTail\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "{\\\\\\\"password\\\\\\\": \\\\\\\"pa\\\\\\\\\\\\\\\"ssWordTail\\\\\\\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "{\"password\": \"ab\\\\\\\\\"}, tail",
+   "secret": "ab"
+  },
+  {
+   "text": "{\\\"password\\\": \\\"ab\\\\\\\\cdSecretTail\\\", \\\"n\\\": 1}",
+   "secret": "cdSecretTail"
+  },
+  {
+   "text": "{\\\"password\\\": \\\"pa\\\\\\\"ss\\\\\\\\\\\\\\\"WordTail\\\"}",
+   "secret": "WordTail"
+  }
+ ]
+}

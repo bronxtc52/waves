@@ -1,7 +1,9 @@
 """Общие помощники тестов: хороший конфиг и запись waves.json во временный каталог."""
+import contextlib
 import copy
 import json
 import pathlib
+import signal
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -31,7 +33,39 @@ def write_json(directory, data, name="waves.json"):
     return p
 
 
+class _Patches:
+    """Несколько mock.patch как один объект с start/stop (как у одиночного патча)."""
+
+    def __init__(self, *patches):
+        self.patches = patches
+
+    def start(self):
+        for p in self.patches:
+            p.start()
+
+    def stop(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+
 def stub_ensure_roles(wab):
-    """Старые тесты launch не проверяют модели: ensure_roles подменён (claude -p не вызывается)."""
+    """Старые тесты launch не проверяют модели и версию tmux: ensure_roles и require_tmux подменены
+    (claude -p и tmux -V не вызываются)."""
     from unittest import mock
-    return mock.patch.object(wab, "ensure_roles", side_effect=lambda cfg, refresh=False: (dict(cfg["roles"]), {}))
+    return _Patches(
+        mock.patch.object(wab, "ensure_roles", side_effect=lambda cfg, refresh=False: (dict(cfg["roles"]), {})),
+        mock.patch.object(wab, "require_tmux", return_value=None))
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    """Ограничение времени теста (годится и как декоратор). SIGALRM (Linux и macOS): зависший системный вызов превращается в провал теста."""
+    def boom(signum, frame):
+        raise AssertionError(f"не уложился в {seconds} с (повисло)")
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)

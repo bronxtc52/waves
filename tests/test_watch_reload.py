@@ -19,6 +19,10 @@ class TestWatchReload(unittest.TestCase):
         self.dir = pathlib.Path(self._tmp.name)
         self.path = write_json(self.dir, good())
         self.cfg = wab.load_waves(str(self.path))
+        # watch() проверяет tmux при старте; версия не предмет этих тестов (на CI-раннере tmux может не быть)
+        p = mock.patch.object(wab, "require_tmux", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
 
     def run_watch(self, edit):
         """Первый тик правит waves.json, второй запоминает cfg и останавливает watch."""

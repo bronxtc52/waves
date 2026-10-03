@@ -114,6 +114,7 @@ class LaunchEnv(Tmp):
         self.sh_calls = []
         self.probe = mock.Mock(side_effect=lambda m, *a, **k: (m != "fable", "rc=1" if m == "fable" else "rc=0"))
         for name, kw in {"probe_model": {"side_effect": self.probe},
+                         "require_tmux": {"return_value": None},
                          "tmux_alive": {"return_value": False},
                          "prepare_worktree": {"return_value": str(self.dir / "wt")},
                          "sh": {"side_effect": lambda *a, **k: self.sh_calls.append(a)},
@@ -338,6 +339,10 @@ class TestNoticesOnce(Tmp):
         self.avail = {"fable": False}
         self.probe = mock.Mock(side_effect=lambda m, *a, **k: (self.avail.get(m, True), "rc=0" if self.avail.get(m, True) else "rc=1"))
         p = mock.patch.object(wab, "probe_model", self.probe)
+        p.start()
+        self.addCleanup(p.stop)
+        # версия tmux здесь не предмет проверки: на CI-раннере tmux может не быть
+        p = mock.patch.object(wab, "require_tmux", return_value=None)
         p.start()
         self.addCleanup(p.stop)
 

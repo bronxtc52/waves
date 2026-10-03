@@ -25,7 +25,8 @@ def targets(calls):
     out = []
     for c in calls:
         if "-t" in c:
-            out.append((c[1], c[c.index("-t") + 1]))
+            sub = [a for a in c[1:] if a != "-u"][0]  # -u (UTF-8) стоит до подкоманды
+            out.append((sub, c[c.index("-t") + 1]))
     return out
 
 

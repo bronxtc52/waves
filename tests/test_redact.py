@@ -4,8 +4,10 @@
 функцией, и по путям наружу: event() (events.log и экран) и dash.screen_text()."""
 import contextlib
 import io
-import tempfile
 import pathlib
+import subprocess
+import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -96,3 +98,118 @@ class TestRedactPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------- W3: классы пропусков (фикстура), контрольные фразы, время ----------
+
+import json
+import time
+
+FIXTURE = json.loads((pathlib.Path(__file__).parent / "fixtures" / "redact_classes.json").read_text(encoding="utf-8"))
+
+
+class TestRedactClasses(unittest.TestCase):
+    def test_every_example_hidden(self):
+        for cls, examples in FIXTURE.items():
+            if cls == "plain":
+                continue
+            for ex in examples:
+                with self.subTest(cls=cls, text=ex["text"]):
+                    out = wab.redact(ex["text"], limit=10_000)
+                    self.assertNotIn(ex["secret"], out)
+                    self.assertIn("[скрыто]", out)
+
+    def test_plain_phrases_untouched(self):
+        for text in FIXTURE["plain"]:
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text, limit=10_000), text)
+
+    def test_names_stay_visible_and_neighbours_survive(self):
+        out = wab.redact(r'{\"user\": \"bob\", \"password\": \"Hunter2Secret\", \"n\": 1}', limit=10_000)
+        self.assertIn(r'\"user\": \"bob\"', out)
+        self.assertIn("password", out)
+        self.assertIn(r'\"n\": 1', out)
+        self.assertEqual(wab.redact("mysql --user bob --password Hunter2Secret --host db", limit=10_000),
+                         "mysql --user bob --password [скрыто] --host db")
+
+
+class TestRedactEscapeLevels(unittest.TestCase):
+    """Закрывающая кавычка значения — ровно разделитель своего уровня экранирования (W3-r2): ни секрет,
+    ни его хвост не доходят до event() (events.log, экран) и до экрана дашборда."""
+
+    def examples(self):
+        return FIXTURE["escape_levels"]
+
+    def test_redact_hides_value_and_tail(self):
+        for ex in self.examples():
+            with self.subTest(text=ex["text"]):
+                out = wab.redact(ex["text"], limit=10_000)
+                self.assertNotIn(ex["secret"], out)
+                self.assertIn("password" if "password" in ex["text"] else "token", out)
+                self.assertIn("[скрыто]", out)
+
+    def test_names_and_neighbours_survive(self):
+        out = wab.redact(r'{\"user\": \"bob\", \"token\": \"to\\\"kenTail\", \"n\": 1}', limit=10_000)
+        self.assertIn(r'\"user\": \"bob\"', out)
+        self.assertIn("token", out)
+        self.assertNotIn("kenTail", out)
+        self.assertIn(r'\"n\": 1', out)
+
+    def test_event_log_and_screen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = wab.load_waves(str(write_json(pathlib.Path(tmp), good())))
+            for ex in self.examples():
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    wab.event(cfg, "W1: BLOCKED: " + ex["text"])
+                log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                self.assertNotIn(ex["secret"], out.getvalue(), ex["text"])
+                self.assertNotIn(ex["secret"], log, ex["text"])
+
+    def test_dash_screen_text(self):
+        dash = import_dash()  # без rich — с заглушками; рендер тут не нужен, только вычистка
+        pane = "работаю\n" + "\n".join(ex["text"] for ex in self.examples()) + "\nготово\n"
+        with mock.patch.object(dash.wab, "pane_text", return_value=pane):
+            text = dash.screen_text("wab-W1", rows=100, width=500)
+        for ex in self.examples():
+            self.assertNotIn(ex["secret"], text, ex["text"])
+        self.assertIn("готово", text)
+
+
+class TestRedactLinear(unittest.TestCase):
+    """Шаблоны не должны вести себя квадратично: до W3 300 КБ без «@» занимали ~115 с."""
+
+    def timed(self, text):
+        """Время redact() в дочернем процессе: регулярное выражение не прерывается сигналом, поэтому
+        регрессия должна падать по timeout подпроцесса, а не вешать прогон тестов."""
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import wab; text = sys.stdin.read(); "
+                "t = time.monotonic(); wab.redact(text, limit=10_000); print(time.monotonic() - t)")
+        scripts = str(pathlib.Path(helpers.__file__).resolve().parent.parent / "scripts")
+        try:
+            r = subprocess.run([sys.executable, "-B", "-c", code, scripts], input=text, capture_output=True,
+                               text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("redact не уложился в 30 с на входе 300 КБ (квадратичный шаблон?)")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return float(r.stdout.strip())
+
+    def test_300kb_without_at(self):
+        self.assertLess(self.timed("word.another-one_x " * 16_000), 1.0)
+        self.assertLess(self.timed("a.b-c+d" * 43_000), 1.0)
+
+    def test_300kb_single_letter_string(self):
+        self.assertLess(self.timed("a" * 300_000), 1.0)
+        self.assertLess(self.timed("abcdefghij" * 30_000), 1.0)
+
+    def test_300kb_many_at_and_prefix_repeats(self):
+        self.assertLess(self.timed("a@" * 150_000), 1.0)
+        self.assertLess(self.timed("sk-" * 100_000), 1.0)
+        self.assertLess(self.timed("a_" * 150_000), 1.0)
+        self.assertLess(self.timed("x-" * 150_000 + "password"), 1.0)
+
+    def test_300kb_escaped_quote_runs(self):
+        head = r'{\"password\": \"'
+        self.assertLess(self.timed(head + r'\\\"' * 50_000 + r'\"' * 50_000), 1.0)
+        self.assertLess(self.timed(head + (r'\\\"\"' * 37_500)), 1.0)
+        self.assertLess(self.timed('password="' + r'\\\\\"' * 50_000), 1.0)
+        self.assertLess(self.timed('password=' + "\\" * 300_000), 1.0)
