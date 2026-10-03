@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """wave-autobot, живой дашборд: `dash.py <waves.json>` (запускать внутри tmux, выход — Ctrl-C)."""
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -27,10 +28,15 @@ STYLE = {  # phase/status -> (icon, colour, label)
     "RESUMING": ("↻", "cyan", "свежая голова"),
     "checkpoint": ("💾", "yellow", "handoff"),
     "HANDOFF_READY": ("💾", "yellow", "handoff готов"),
-    "BLOCKED": ("✋", "bold red", "ждёт тебя"),
+    "BLOCKED": ("✋", "bold red reverse", "ждёт тебя"),
     "DONE": ("✔", "bold green", "готово"),
     "dead": ("✖", "bold red", "окно закрыто"),
+    "gate": ("⧗", "yellow", "гейт мерджа"),
+    "awaiting_merge": ("⏳", "bold yellow reverse", "ждёт мерджа"),
+    "merge_unverified": ("⚠", "bold red", "мердж не подтверждён"),
+    "merged": ("✔", "bold green", "смержено"),
 }
+STATUS_LINE_MAX = 80   # строка status-bar tmux
 
 
 def fmt_dur(sec):
@@ -121,29 +127,120 @@ def commits_since(cwd, started):
 
 
 def wave_state(cfg, st, wave):
+    """Ключ STYLE для волны. Фазы гейта (W4) важнее статуса: на DONE окно живо до MERGED, а после
+    merged закрыто диспетчером — ни то, ни другое не «dead»."""
     w = st["waves"].get(wave)
     if not w:
         return "pending", w
+    phase = w.get("phase")
+    if phase == "merged":
+        return "merged", w
+    if phase == "merge_unverified":
+        return "merge_unverified", w
     status = wab.redact(wab.read(wab.wave_path(cfg, wave) / "status"))
     if status.startswith("BLOCKED"):
         return "BLOCKED", w
-    if w.get("phase") == "checkpoint" and status != "HANDOFF_READY":
+    if phase in ("gate", "awaiting_merge"):
+        return phase, w
+    if phase == "checkpoint" and status != "HANDOFF_READY":
         return "checkpoint", w
     if st.get("current") == wave and not wab.tmux_alive(w["tmux"]) and status != "DONE":
         return "dead", w
     return status or "STARTING", w
 
 
+def _first_reason(w):
+    reasons = ((w or {}).get("gate") or {}).get("reasons") or []
+    return wab.redact(" ".join(str(reasons[0]).split())) if reasons else ""
+
+
+def _pr_number(w):
+    return ((w or {}).get("pr") or {}).get("number")
+
+
+def style_for(cfg, st, wave):
+    """(ключ, иконка, цвет, подпись): подписи гейта собраны из w["gate"] и w["pr"]."""
+    key, w = wave_state(cfg, st, wave)
+    icon, colour, label = STYLE.get(key, ("?", "white", key))
+    if key == "gate" and _first_reason(w):
+        label = f"гейт: {_first_reason(w)}"
+    elif key == "awaiting_merge" and _pr_number(w):
+        label = f"ждёт мерджа PR #{_pr_number(w)}"
+    return key, icon, colour, label
+
+
+def gate_line(w):
+    """Вердикт гейта и причины одной строкой (через redact); нет записи — пусто."""
+    g = (w or {}).get("gate")
+    if not g:
+        return ""
+    reasons = "; ".join(" ".join(str(r).split()) for r in g.get("reasons") or [])
+    return wab.redact(f"гейт: {g.get('verdict')}" + (f" — {reasons}" if reasons else ""))
+
+
+STATUS_WORDS = {"BLOCKED": "✋ BLOCKED", "RUNNING": "работает", "dead": "окно закрыто",
+                "merge_unverified": "мердж не подтверждён", "merged": "смержено", "gate": "гейт мерджа",
+                "checkpoint": "handoff", "DONE": "DONE", "pending": "в очереди"}
+
+
+def status_line(cfg, st):
+    """Короткая строка для status-right tmux: ≤ STATUS_LINE_MAX, одна строка, через redact,
+    «#» удвоена (tmux раскрывает #{…} и #[…] в статусе)."""
+    wave = st.get("current")
+    if wave and wave in (st.get("waves") or {}):
+        key, _icon, _colour, label = style_for(cfg, st, wave)
+        if key == "awaiting_merge":
+            text = label
+        elif key == "gate":
+            text = label
+        else:
+            text = STATUS_WORDS.get(key, label)
+        raw = f"wab {wave}: {text}"
+    elif st.get("pending_launch"):
+        raw = f"wab: запускаю {st['pending_launch'].get('wave')}"
+    else:
+        raw = "wab: нет текущей волны"
+    raw = " ".join(wab.redact(raw).split())   # переводы строк и прочие пробельные — в один пробел
+    raw = "".join(ch for ch in raw if ch.isprintable())
+    raw = raw[:STATUS_LINE_MAX]
+    while len(raw.replace("#", "##")) > STATUS_LINE_MAX:
+        raw = raw[:-1]
+    return raw.replace("#", "##")
+
+
+class TmuxStatus:
+    """Ставит status_line в status-right СВОЕЙ сессии tmux (dash запущен внутри tmux), только при
+    изменении строки. Вне tmux — ничего; ошибки tmux глотаются: дашборд не падает из-за статуса."""
+
+    def __init__(self, run=subprocess.run):
+        self.run = run
+        self.last = None
+
+    def update(self, cfg, st):
+        if not os.environ.get("TMUX"):
+            return
+        line = status_line(cfg, st)
+        if line == self.last:
+            return
+        try:
+            # без -t и -g: сессия берётся из $TMUX/$TMUX_PANE, чужие сессии не трогаем
+            r = self.run(["tmux", "set-option", "status-right", line], capture_output=True, text=True,
+                         timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return
+        if getattr(r, "returncode", 1) == 0:
+            self.last = line
+
+
 def pipeline(cfg, st):
     ids = wab.wave_ids(cfg)
     t = Text(justify="center")
     for i, wave in enumerate(ids):
-        key, _ = wave_state(cfg, st, wave)
-        icon, colour, _ = STYLE.get(key, ("?", "white", key))
+        key, icon, colour, _ = style_for(cfg, st, wave)
         current = st.get("current") == wave
         t.append(f" {icon} {wave} ", style=f"{colour} {'reverse' if current else ''}")
         if i < len(ids) - 1:
-            done = key == "DONE"
+            done = key in ("DONE", "merged")
             t.append(" ━━▶ " if done else " ──▷ ", style="green" if done else "grey42")
     sub = Text("  ·  ".join(f"{w['id']}: {w['title']}" for w in cfg["waves"]),
                style="grey62", justify="center")
@@ -158,8 +255,8 @@ def waves_table(cfg, st):
         tb.add_column(col, justify=j, no_wrap=True)
     now = time.time()
     for wave in wab.wave_ids(cfg):
-        key, w = wave_state(cfg, st, wave)
-        icon, colour, label = STYLE.get(key, ("?", "white", key))
+        key, icon, colour, label = style_for(cfg, st, wave)
+        w = st["waves"].get(wave)
         if not w:
             tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 9)
             continue
@@ -199,7 +296,11 @@ def current_panel(cfg, st):
     ctx = Group(Text("Контекст ", style="bold").append(bar(w.get("tokens", 0), cfg["ctx_limit"], 40)),
                 Text("История  ", style="bold").append(spark(w.get("ctx_hist", []), cfg["ctx_limit"])))
     screen = Text(screen_text(w["tmux"]), style="grey78")
-    return Panel(Group(head, Text(), ctx, Text(), Panel(screen, title="экран волны (live)",
+    gl = gate_line(w)
+    verdict = (w.get("gate") or {}).get("verdict")
+    gate_text = Text(gl, style="bold red" if verdict == "fail" else "bold green" if verdict == "pass"
+                     else "bold yellow") if gl else Text()
+    return Panel(Group(head, gate_text, ctx, Text(), Panel(screen, title="экран волны (live)",
                                                          border_style="grey35", box=box.ROUNDED)),
                  title=f"⚙ Текущая волна {wave}", border_style="magenta")
 
@@ -230,7 +331,11 @@ def roles_line(cfg, st):
 
 def header(cfg, st):
     waves = st["waves"]
-    done = sum(1 for w in wab.wave_ids(cfg) if wab.read(wab.wave_path(cfg, w) / "status") == "DONE")
+    # DONE волны ещё не «готово», пока PR не смержен (фазы гейта W4)
+    done = sum(1 for w in wab.wave_ids(cfg)
+               if (waves.get(w) or {}).get("phase") == "merged"
+               or (wab.read(wab.wave_path(cfg, w) / "status") == "DONE"
+                   and (waves.get(w) or {}).get("phase") not in ("gate", "awaiting_merge", "merge_unverified")))
     started = min((w["started"] for w in waves.values()), default=time.time())
     restarts = sum(w.get("restarts", 0) for w in waves.values())
     turns = sum(transcript_stats(w["cwd"], w.get("sessions"))["turns"] for w in waves.values())
@@ -278,10 +383,15 @@ def main():
         cfg = wab.load_waves(sys.argv[1])
     except ConfigError as e:
         sys.exit(str(e))
+    tmux_status = TmuxStatus()
     with Live(safe_render(cfg), refresh_per_second=1, screen=True) as live:
         while True:
             time.sleep(3)
             live.update(safe_render(cfg))
+            try:
+                tmux_status.update(cfg, wab.load_state(cfg))
+            except Exception:  # noqa: BLE001 — гонка чтения state: статус обновится на следующем кадре
+                pass
 
 
 if __name__ == "__main__":

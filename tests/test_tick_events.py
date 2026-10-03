@@ -425,6 +425,22 @@ class TestHandoffResume(_Base):
         self.assertEqual(self.calls, [])
         self.assertEqual(w["phase"], "clearing")
 
+    def test_resuming_written_before_send_and_agent_status_kept(self):
+        """RESUMING — до отправки продолжения; быстрый агент, успевший записать RUNNING, не затирается."""
+        import time as _t
+        wdir = wab.wave_dir(self.cfg, "W1")
+        seen = []
+
+        def agent_answers(name, text):
+            seen.append((wdir / "status").read_text(encoding="utf-8").strip())
+            (wdir / "status").write_text("RUNNING\n", encoding="utf-8")
+        with mock.patch.object(wab, "send_text", side_effect=agent_answers):
+            w, _ = self.tick(self.state("clearing", clear_sent=True,
+                                        clear_at=_t.time() - wab.CLEAR_SETTLE_SECONDS - 1))
+        self.assertEqual(seen, ["RESUMING"])
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RUNNING")
+        self.assertEqual(w["phase"], "running")
+
     def test_ready_after_settle_resumes_with_marker(self):
         import time as _t
         w, wdir = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - wab.CLEAR_SETTLE_SECONDS - 1))

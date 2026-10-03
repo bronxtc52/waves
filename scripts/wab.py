@@ -999,9 +999,12 @@ def wave_argv(cfg, wave, roles, system_prompt_path, session_id=None):
 def probe_model(model, timeout=PROBE_TIMEOUT_SECONDS):
     """Доступна ли модель: короткий `claude -p`. (ok, detail); вывод модели и stderr не возвращаем."""
     try:
+        # не-UTF-8 локаль (LC_ALL=C без UTF-8 mode): кириллица в argv кодируется явно, вывод claude
+        # читается как UTF-8 с заменой — иначе UnicodeEncodeError/UnicodeDecodeError вместо ответа
         r = subprocess.run(["claude", "-p", "--model", model, "--no-session-persistence",
-                            "Ответь одним словом: ok"],
-                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+                            "Ответь одним словом: ok".encode("utf-8")],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, "timeout"
     except FileNotFoundError:
@@ -1623,6 +1626,9 @@ def tick(cfg, st, waves_json=None):
             return True
         w["phase"] = "resuming"  # до отправки: перезапущенный watch не досылает продолжение вслепую
         save_state(cfg, st)
+        # RESUMING — до отправки: быстрый агент успевает записать RUNNING/BLOCKED/DONE, и запись
+        # после send_text затёрла бы его статус. После отправки status не трогаем
+        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
         # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update;
         # метка волны в начале — по ней находится новый журнал сессии
         send_text(name, continue_text(cfg, wave, wdir))
@@ -1634,7 +1640,6 @@ def tick(cfg, st, waves_json=None):
         w["checkpoint_at"] = None
         w.pop("clear_at", None)
         w.pop("clear_sent", None)
-        (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
         save_state(cfg, st)
         return True
 
