@@ -26,9 +26,11 @@ import os
 import pathlib
 import re
 import shlex
+import stat
 import subprocess
 import sys
 import time
+import uuid
 
 import waves_config
 from waves_config import ConfigError, load_waves
@@ -45,6 +47,13 @@ RELOADABLE = ("ctx_limit", "idle_minutes", "tick_seconds")  # что watch пе�
 CLEAR_SETTLE_SECONDS = 6       # пауза прототипа, проверена вживую; детерминированный сигнал окончания /clear — волна W3
 PROBE_TIMEOUT_SECONDS = 120    # проверка модели: один короткий `claude -p`
 RUN_LOCK_TIMEOUT_SECONDS = 30  # дольше блокировку прогона не ждём: зависший wab.py не вешает launch навсегда
+MIN_TMUX = (3, 2)              # new-session -e (3.2+)
+READY_AFTER_CLEAR_SECONDS = 90 # сколько окно может не становиться готовым после /clear
+TAIL_BYTES = 4_000_000         # контекст меряется по последним 4 МБ журнала
+FIRST_MESSAGE_BYTES = 256 * 1024
+HEAD_BYTES = 4096              # проверка подлинности журнала: хеш первых 4 КБ
+READ_CHUNK = 1 << 20
+PLAN_MAX_BYTES = 1024 * 1024   # waves.md крупнее мегабайта — не план
 
 
 # ---------- конфиг и состояние ----------
@@ -103,6 +112,32 @@ def run_lock(cfg, timeout=None):
         os.close(fd)  # закрытие дескриптора снимает flock
 
 
+@contextlib.contextmanager
+def dispatcher_lock(cfg):
+    """Один watch на прогон: неблокирующий flock на run_dir/dispatcher.lock на всё время `watch`.
+
+    Отдельный файл от state.lock: та блокировка короткая и берётся на каждый тик, эта живёт
+    столько же, сколько процесс watch. Занят — SystemExit: два watch слали бы волне
+    контрольные точки и /clear вдвое. launch эту блокировку не берёт. Симлинк вместо файла — отказ.
+    """
+    run_dir = cfg["run_dir"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "dispatcher.lock"
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except OSError as e:
+        raise SystemExit(f"файл блокировки {path} не открыт: {e}")
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"другой watch уже следит за прогоном {run_dir} (блокировка {path}); "
+                             f"остановите его или дождитесь завершения")
+        yield
+    finally:
+        os.close(fd)  # закрытие дескриптора снимает flock
+
+
 def event(cfg, text, trusted=""):
     """Строка в журнал событий (events.log) и на экран; дашборд читает журнал.
 
@@ -119,7 +154,10 @@ def event(cfg, text, trusted=""):
     cfg["run_dir"].mkdir(parents=True, exist_ok=True)
     with open(cfg["run_dir"] / "events.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:  # терминал не UTF-8 (C-локаль): журнал уже записан, на экран — с экранированием
+        print(line.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
 
 
 def wave_path(cfg, wave):
@@ -135,13 +173,39 @@ def wave_dir(cfg, wave):
 
 def read(p):
     p = pathlib.Path(p)
-    return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+    return p.read_text(encoding="utf-8", errors="replace").strip() if p.exists() else ""
 
 
 # ---------- tmux ----------
 
+def parse_tmux_version(text):
+    """`tmux 3.4` -> (3, 4); `3.2a` -> (3, 2); `next-3.5` -> (3, 5); `master` -> самая новая."""
+    text = (text or "").strip()
+    if re.search(r"\bmaster\b", text):
+        return (99, 0)
+    m = re.search(r"(\d+)\.(\d+)", text)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def require_tmux():
+    """SystemExit с понятным текстом, если tmux не запускается или старше MIN_TMUX.
+    Вызывает tmux напрямую, не через sh(): проверка не должна попадать в журнал вызовов tmux."""
+    try:
+        r = subprocess.run(["tmux", "-V"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError as e:
+        raise SystemExit(f"нужен tmux >= {MIN_TMUX[0]}.{MIN_TMUX[1]}, но запустить его не удалось: {e}")
+    version = parse_tmux_version(r.stdout) if r.returncode == 0 else None
+    if version is None:
+        raise SystemExit(f"версия tmux не определена (tmux -V: rc={r.returncode} {r.stdout.strip()!r}); "
+                         f"нужен tmux >= {MIN_TMUX[0]}.{MIN_TMUX[1]}")
+    if version < MIN_TMUX:
+        raise SystemExit(f"tmux {version[0]}.{version[1]} слишком старый: нужен tmux >= "
+                         f"{MIN_TMUX[0]}.{MIN_TMUX[1]} (new-session -e)")
+
+
 def sh(*args, check=True, **kw):
-    return subprocess.run(args, check=check, capture_output=True, text=True, **kw)
+    return subprocess.run(args, check=check, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **kw)
 
 
 def sess_target(name):
@@ -155,7 +219,9 @@ def pane_target(name):
 
 
 def send_keys(name, *keys, check=True):
-    return sh("tmux", "send-keys", "-t", pane_target(name), *keys, check=check)
+    # -u (глобальный флаг клиента, до подкоманды): UTF-8 независимо от локали, иначе в C-локали
+    # кириллица в send-keys -l превращается в «_»
+    return sh("tmux", "-u", "send-keys", "-t", pane_target(name), *keys, check=check)
 
 
 def tmux_alive(name):
@@ -167,7 +233,7 @@ def pane_text(name, join=False):
     склеиваются, и секрет, разрезанный переносом, redact() узнаёт целиком (для показа наружу).
     Маркеры готовности ищутся на обычном захвате: им склейка не нужна."""
     flags = ("-p", "-J") if join else ("-p",)
-    r = sh("tmux", "capture-pane", *flags, "-t", pane_target(name), check=False)
+    r = sh("tmux", "-u", "capture-pane", *flags, "-t", pane_target(name), check=False)
     return r.stdout if r.returncode == 0 else ""
 
 
@@ -205,34 +271,183 @@ def wait_ready(name, timeout=90):
     return False
 
 
-# ---------- заполненность контекста по транскрипту ----------
+# ---------- журнал сессии волны: контекст и привязка ----------
 
 def transcript_dir(cwd):
     return PROJECTS / re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
 
 
-def context_tokens(cwd):
-    """Токены в окне на последнем ходе ассистента основного потока в самом свежем транскрипте."""
-    d = transcript_dir(cwd)
-    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime) if d.exists() else []
-    if not files:
+def transcript_path(cwd, session_id):
+    return transcript_dir(cwd) / f"{session_id}.jsonl"
+
+
+def _num(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+class TranscriptCache:
+    """Инкрементальный читатель журналов сессий. На файл помнит (dev, inode, смещение, недописанную
+    последнюю строку, счётчик): повторный вызов читает только дописанное, усечённый или подменённый
+    файл читается заново. С `tail_bytes` первое чтение начинается с этого расстояния от конца,
+    обрезанная первая строка отбрасывается (журнал вырастает до сотен МБ)."""
+
+    def __init__(self, tail_bytes=None):
+        self.tail_bytes = tail_bytes
+        self.entries = {}
+        self.bytes_read = 0
+
+    @staticmethod
+    def _blank(key):
+        return {"key": key, "offset": None, "partial": b"", "discard_first": False, "head": None, "ctx": 0}
+
+    def read(self, path):
+        path = str(path)
+        try:
+            stt = os.stat(path)
+        except OSError:
+            self.entries.pop(path, None)
+            return {"ctx": 0}
+        key = (stt.st_dev, stt.st_ino)
+        e = self.entries.get(path)
+        if e is None or e["key"] != key or stt.st_size < (e["offset"] or 0):
+            e = self.entries[path] = self._blank(key)
+        try:
+            with open(path, "rb") as f:
+                if e["head"] is not None:  # тот же inode и не короче, но переписан на месте?
+                    length, digest = e["head"]
+                    if hashlib.sha1(f.read(length)).hexdigest() != digest:
+                        e = self.entries[path] = self._blank(key)
+                if e["offset"] is None:
+                    head = f.read(min(HEAD_BYTES, stt.st_size))
+                    e["head"] = (len(head), hashlib.sha1(head).hexdigest())
+                    start = 0
+                    if self.tail_bytes and stt.st_size > self.tail_bytes:
+                        start = stt.st_size - self.tail_bytes
+                        e["discard_first"] = True
+                    e["offset"] = start
+                f.seek(e["offset"])
+                while True:  # кусками: журнал может быть в сотни МБ
+                    data = f.read(READ_CHUNK)
+                    if not data:
+                        break
+                    self.bytes_read += len(data)
+                    e["offset"] += len(data)
+                    lines = (e["partial"] + data).split(b"\n")
+                    e["partial"] = lines.pop()
+                    for raw in lines:
+                        if e["discard_first"]:
+                            e["discard_first"] = False
+                            continue
+                        self._count(e, raw)
+        except OSError:
+            pass
+        return {"ctx": e["ctx"]}
+
+    @staticmethod
+    def _count(e, raw):
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(d, dict) or d.get("type") != "assistant" or d.get("isSidechain"):
+            return
+        msg = d.get("message") if isinstance(d.get("message"), dict) else {}
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else None
+        if u:
+            e["ctx"] = (_num(u.get("input_tokens")) + _num(u.get("cache_creation_input_tokens"))
+                        + _num(u.get("cache_read_input_tokens")))
+
+
+CACHE = TranscriptCache(tail_bytes=TAIL_BYTES)
+
+
+def context_tokens(w):
+    """Токены в окне на последнем ходе ассистента основного потока в журнале ТЕКУЩЕЙ сессии волны.
+    Журнал ищется по session_id, а не «самый свежий в каталоге»: каталог могут делить волны и попытки."""
+    sessions = w.get("sessions") or []
+    if not sessions or not w.get("cwd"):
         return 0
-    with open(files[-1], "rb") as f:  # читаем ограниченный хвост: транскрипты вырастают до сотен МБ
-        f.seek(0, os.SEEK_END)
-        f.seek(max(0, f.tell() - 4_000_000))
-        lines = f.read().splitlines()[-400:]
-    for raw in reversed(lines):
+    return CACHE.read(transcript_path(w["cwd"], sessions[-1]))["ctx"]
+
+
+def session_marker(cfg, wave):
+    """Метка волны в начале первого сообщения сессии: по ней после /clear находим новый журнал."""
+    return f"[wab:{cfg['chain']}/{cfg['run_id']}/{wave}]"
+
+
+# Что Claude Code сам пишет в свежий журнал после /clear до первого настоящего сообщения:
+# isMeta-предупреждение, эхо /clear и его (пустой) stdout. Это не сообщение волны.
+_CLEAR_SCAFFOLD = re.compile(
+    r"\s*(?:<local-command-caveat>.*</local-command-caveat>"
+    r"|<local-command-stdout>.*</local-command-stdout>"
+    r"|<command-name>/clear</command-name>\s*<command-message>clear</command-message>"
+    r"\s*<command-args>\s*</command-args>)\s*", re.S)
+
+
+def _first_user_text(path):
+    """Текст первого user-сообщения основного потока в первых 256 КБ журнала (строка или text-блоки
+    списка; tool_result не считается). Служебные строки /clear пропускаются: метка стоит в
+    продолжении, которое идёт после /clear."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(FIRST_MESSAGE_BYTES)
+    except OSError:
+        return ""
+    lines = head.split(b"\n")
+    if len(head) >= FIRST_MESSAGE_BYTES:
+        lines.pop()  # обрезана посреди строки
+    for raw in lines:
         try:
             d = json.loads(raw)
         except ValueError:
             continue
-        if d.get("type") != "assistant" or d.get("isSidechain"):
+        if not isinstance(d, dict) or d.get("type") != "user" or d.get("isSidechain") or d.get("isMeta"):
             continue
-        u = (d.get("message") or {}).get("usage")
-        if u:
-            return (u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
-                    + u.get("cache_read_input_tokens", 0))
-    return 0
+        msg = d.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+        text = None
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            texts = [c.get("text", "") for c in content
+                     if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str)]
+            if texts:
+                text = "\n".join(texts)
+        if text is not None and not _CLEAR_SCAFFOLD.fullmatch(text):
+            return text
+    return ""
+
+
+def owned_sessions(st):
+    """Все id сессий, уже принадлежащих какой-либо волне: текущие И прежних попыток
+    (перезапущенная волна оставляет старые журналы, а в них та же метка)."""
+    owned = set()
+    for w in st["waves"].values():
+        for rec in [w, *(w.get("attempts") or [])]:
+            owned.update(rec.get("sessions") or [])
+    return owned
+
+
+def find_new_session(cfg, st, wave):
+    """После /clear волна продолжается в новом файле журнала. Ищем его по метке в первом настоящем
+    сообщении среди журналов этой рабочей копии, которых ещё нет ни у одной волны; свежие первыми."""
+    owned = owned_sessions(st)
+    d = transcript_dir(st["waves"][wave]["cwd"])
+    if not d.exists():
+        return None
+    marker = session_marker(cfg, wave)
+    files = []
+    for f in d.glob("*.jsonl"):
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    for _, f in sorted(files, key=lambda t: t[0], reverse=True):
+        if f.stem in owned:
+            continue
+        if marker in _first_user_text(f):
+            return f.stem
+    return None
 
 
 # ---------- вычистка секретов из текста ----------
@@ -514,8 +729,52 @@ def _check_launchable(cfg, st, wave, name):
         raise SystemExit(f"волна {wave} уже запускается другим wab.py (pid {prev_rec['launcher_pid']}); "
                          f"дождитесь его завершения")
     if tmux_alive(name):
+        if cur == wave and (prev_rec or {}).get("phase") in ("starting", "not_ready") \
+                and not _pid_alive((prev_rec or {}).get("launcher_pid")):
+            raise SystemExit(f"tmux-сессия {name} уже существует: прошлый launch прерван до отправки "
+                             f"задачи (фаза {prev_rec['phase']}). Закройте её: "
+                             f"tmux kill-session -t ={name} — и запустите launch этой волны заново")
         raise SystemExit(f"tmux-сессия {name} уже существует")
     return cur, prev_rec
+
+
+def check_plan(cfg):
+    """Пин плана: sha256 файла waves.md рядом с waves.json должен совпасть с plan_sha256 из конфига.
+
+    Не задан — предупреждение, без проверки. Нет файла, не обычный файл (симлинк, каталог),
+    больше PLAN_MAX_BYTES или другой хеш — событие и SystemExit `BLOCKED: plan changed since
+    approval: …`. Вызывается в launch до резерва и любых побочных эффектов.
+    """
+    want = cfg.get("plan_sha256")
+    if not want:
+        print("предупреждение: plan_sha256 не задан в waves.json — план waves.md не проверяется",
+              file=sys.stderr)
+        return
+    path = cfg["plan_path"]
+
+    def refuse(why, short=None):
+        event(cfg, f"BLOCKED: plan changed since approval: {short or why}", trusted=f" (файл {path})")
+        raise SystemExit(f"BLOCKED: plan changed since approval: {why} (файл {path})")
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        refuse("файла waves.md нет")
+    except OSError as e:
+        refuse(f"waves.md не открыт (симлинк или нет доступа): {e.strerror or e}")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            refuse("waves.md не обычный файл")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            data = f.read(PLAN_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > PLAN_MAX_BYTES:
+        refuse(f"waves.md больше {PLAN_MAX_BYTES // (1024 * 1024)} МБ")
+    got = hashlib.sha256(data).hexdigest()
+    if got != want:
+        refuse(f"sha256 waves.md не совпадает с plan_sha256 (в конфиге {want[:12]}…, в файле {got[:12]}…)",
+               short="sha256 waves.md не совпадает с plan_sha256")
 
 
 def launch(cfg, wave, prompt_file):
@@ -529,6 +788,8 @@ def launch(cfg, wave, prompt_file):
         raise SystemExit(f"файл промпта {prompt_file} не прочитан: {e}")
     if not prompt:
         raise SystemExit(f"файл промпта {prompt_file} пустой")
+    require_tmux()   # до worktree и резерва: старый tmux не должен оставить после себя следов
+    check_plan(cfg)
     name = f"{cfg['tmux_prefix']}{wave.lower()}"
     # дешёвая предварительная проверка — до платных проверок моделей; окончательная — под резервом ниже
     with run_lock(cfg):
@@ -536,6 +797,7 @@ def launch(cfg, wave, prompt_file):
     # модели ролей — до резерва и вне блокировки: проверка долгая, а блокировку ждут 30 с
     roles, _ = ensure_roles(cfg)
     wave_obj = next(w for w in cfg["waves"] if w["id"] == wave)
+    sid = str(uuid.uuid4())  # id сессии задаём сами: журнал волны известен заранее
     # проверка и резерв — одним шагом под блокировкой прогона: иначе два координатора при
     # пустом current оба пройдут проверку и запустят две волны, а current достанется последней
     with run_lock(cfg):
@@ -544,8 +806,13 @@ def launch(cfg, wave, prompt_file):
         # резерв до worktree и tmux: параллельный launch увидит волну, а watch — её запись
         st.setdefault("waves", {})
         st["current"] = wave
-        st["waves"][wave] = {"tmux": name, "cwd": None, "started": time.time(), "restarts": 0,
-                             "phase": "starting", "notified": {}, "launcher_pid": os.getpid()}
+        rec = {"tmux": name, "cwd": None, "started": time.time(), "restarts": 0,
+               "phase": "starting", "notified": {}, "launcher_pid": os.getpid(), "sessions": [sid]}
+        # журналы прежних попыток остаются в каталоге с той же меткой: помним их, чтобы не привязать
+        old = (prev_rec or {}).get("sessions")
+        if old or (prev_rec or {}).get("attempts"):
+            rec["attempts"] = [*((prev_rec or {}).get("attempts") or []), {"sessions": list(old or [])}]
+        st["waves"][wave] = rec
         save_state(cfg, st)
     try:
         wdir = wave_dir(cfg, wave)
@@ -553,9 +820,14 @@ def launch(cfg, wave, prompt_file):
         (wdir / "status").write_text("STARTING\n", encoding="utf-8")
         sp = wdir / "system-prompt.md"
         sp.write_text(system_prompt_text(cfg, wave_obj, wdir, cwd, roles), encoding="utf-8")
-        cmd = wave_argv(cfg, wave, roles, sp)
-        sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
-           "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+        cmd = wave_argv(cfg, wave, roles, sp, sid)
+        try:
+            sh("tmux", "new-session", "-d", "-s", name, "-c", cwd, "-x", "220", "-y", "60",
+               "-e", f"WAB_DIR={wdir}", "-e", f"WAB_WAVE={wave}", *cmd)
+        except subprocess.CalledProcessError as e:
+            raise SystemExit(f"tmux new-session не создал сессию {name}: {(e.stderr or '').strip() or e}")
+        except OSError as e:
+            raise SystemExit(f"tmux new-session не запущен: {e}")
     except BaseException:
         # неудачный launch не должен оставить цепочку «занятой»
         _release_reservation(cfg, wave, cur, prev_rec)
@@ -567,7 +839,7 @@ def launch(cfg, wave, prompt_file):
         _update_wave(cfg, wave, phase="not_ready")
         event(cfg, f"{wave}: окно Claude не готово в {name}, промпт НЕ отправлен; посмотреть: tmux attach -t ={name}")
         return False
-    head = (f"[wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
+    head = (f"{session_marker(cfg, wave)} [wave-autobot] Волна {wave}. Каталог волны: {wdir} (он же $WAB_DIR). "
             f"Рабочая копия (git worktree): {cwd}. Протокол — в системной инструкции.\n\n")
     (wdir / "first-prompt.md").write_text(head + prompt + "\n", encoding="utf-8")
     send_text(name, head + prompt)
@@ -629,12 +901,16 @@ def system_prompt_text(cfg, wave_obj, wdir, cwd, roles):
     return PROTOCOL.read_text(encoding="utf-8").rstrip() + "\n\n" + ctx
 
 
-def wave_argv(cfg, wave, roles, system_prompt_path):
-    """Команда запуска сессии волны: кодер на своей модели, роли — субагентами, AskUserQuestion запрещён."""
-    return ["claude", "--model", roles["coder"], "--permission-mode", "auto",
+def wave_argv(cfg, wave, roles, system_prompt_path, session_id=None):
+    """Команда запуска сессии волны: кодер на своей модели, роли — субагентами, AskUserQuestion запрещён.
+    session_id — id первой сессии волны (--session-id): её журнал известен диспетчеру заранее."""
+    argv = ["claude", "--model", roles["coder"], "--permission-mode", "auto",
             "--append-system-prompt-file", str(system_prompt_path),
             "--agents", agents_json(roles), "--disallowedTools", "AskUserQuestion",
             "--name", f"wab-{cfg['chain']}-{wave}"]
+    if session_id:
+        argv += ["--session-id", session_id]
+    return argv
 
 
 def probe_model(model, timeout=PROBE_TIMEOUT_SECONDS):
@@ -839,6 +1115,19 @@ def tick(cfg, st, waves_json=None):
         save_state(cfg, st)
         return False  # цепочка стоит: перезапустить волну руками и снова запустить watch
 
+    if w.get("phase") == "starting":
+        # сюда попадаем, только если launcher_pid мёртв (иначе вернулись выше): launch убит после
+        # new-session, задача не отправлена. Ведём как обычную волну нельзя — владелец решает.
+        msg = (f"BLOCKED: launch прерван до отправки задачи; закройте окно (tmux kill-session -t ={name}) "
+               f"и запустите launch этой волны заново")
+        w["phase"] = "not_ready"
+        w.pop("launcher_pid", None)
+        w["notified"]["blocked"] = msg  # ветка BLOCKED ниже не повторит событие
+        (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        event(cfg, f"{wave}: {msg}; {attach}")
+        save_state(cfg, st)
+        return True
+
     if status.startswith("BLOCKED"):
         if once_per(w, "blocked", status):
             # статус целиком: event() вычищает до ограничения длины; срез сырого текста здесь
@@ -848,24 +1137,63 @@ def tick(cfg, st, waves_json=None):
         return True
 
     if status == "HANDOFF_READY" and w["phase"] == "checkpoint":
-        send_command(name, "/clear")
-        # сразу после /clear панель ещё показывает старый экран с «? for shortcuts» — сначала пауза
-        time.sleep(CLEAR_SETTLE_SECONDS)
-        if not wait_ready(name):
-            msg = "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
-            event(cfg, f"{wave}: {msg}; {attach}")
-            w["phase"] = "not_ready"
-            w["notified"]["blocked"] = msg  # ветка BLOCKED на следующем тике не повторит событие
-            (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        # каждое состояние пишется на диск ДО действия; в tick нет ожиданий — окно проверяется на следующих тиках
+        w["phase"] = "clearing"
+        w["clear_at"] = now
+        w["clear_sent"] = False
+        save_state(cfg, st)
+    if w["phase"] == "resuming":
+        # диспетчер упал между сохранением и подтверждением доставки: продолжение могло дойти, а могло нет
+        msg = ("BLOCKED: перезапуск диспетчера при отправке продолжения после /clear; проверьте окно: "
+               "продолжение могло не дойти")
+        event(cfg, f"{wave}: {msg}; {attach}")
+        w["phase"] = "not_ready"
+        w["notified"]["blocked"] = msg
+        (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+        save_state(cfg, st)
+        return True
+    if w["phase"] == "clearing":
+        if not w.get("clear_sent", True):
+            # и после перезапуска диспетчера между сохранением выше и доставкой; пауза считается от отправки
+            w["clear_at"] = now
             save_state(cfg, st)
+            send_command(name, "/clear")
+            w["clear_sent"] = True
+            save_state(cfg, st)
+            event(cfg, f"{wave}: handoff готов, отправлен /clear")
             return True
-        # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update
-        send_text(name, f"Продолжаем волну {wave} wave-autobot после /clear. Каталог волны: {wdir}. "
-                        f"Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
+        since = now - (w.get("clear_at") or now)
+        if since < CLEAR_SETTLE_SECONDS:
+            return True  # сразу после /clear панель ещё показывает старый экран с «? for shortcuts»
+        txt = pane_text(name)
+        if any(m in txt for m in TRUST_MARKERS):
+            # по умолчанию выбрано «No, exit»: сначала сдвигаемся на «Yes, I trust this folder»
+            send_keys(name, "Down")
+            time.sleep(0.5)
+            send_keys(name, "Enter")
+            return True
+        if not any(m in txt for m in READY_MARKERS):
+            if since > READY_AFTER_CLEAR_SECONDS:
+                msg = "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено"
+                event(cfg, f"{wave}: {msg}; {attach}")
+                w["phase"] = "not_ready"
+                w["notified"]["blocked"] = msg  # ветка BLOCKED на следующем тике не повторит событие
+                (wdir / "status").write_text(msg + "\n", encoding="utf-8")
+                save_state(cfg, st)
+            return True
+        w["phase"] = "resuming"  # до отправки: перезапущенный watch не досылает продолжение вслепую
+        save_state(cfg, st)
+        # обычный промпт, а не slash-команда: скилл не зависит от чужих команд вроде /update;
+        # метка волны в начале — по ней находится новый журнал сессии
+        send_text(name, f"{session_marker(cfg, wave)} Продолжаем волну {wave} wave-autobot после /clear. "
+                        f"Каталог волны: {wdir}. Прочитай {wdir}/handoff.md и продолжи с шага «Следующий шаг».")
         event(cfg, f"{wave}: handoff готов, /clear и продолжение (перезапуск №{w['restarts'] + 1})")
         w["restarts"] += 1
         w["phase"] = "running"
+        w["await_session"] = True  # новый журнал привязывается по метке на следующих тиках
         w["checkpoint_at"] = None
+        w.pop("clear_at", None)
+        w.pop("clear_sent", None)
         (wdir / "status").write_text("RESUMING\n", encoding="utf-8")
         save_state(cfg, st)
         return True
@@ -879,12 +1207,23 @@ def tick(cfg, st, waves_json=None):
         save_state(cfg, st)
 
     txt = pane_text(name)
-    tokens = context_tokens(w["cwd"])
-    w["tokens"] = tokens
-    w["peak"] = max(w.get("peak", 0), tokens)
-    w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
+    awaiting = bool(w.get("await_session"))
+    if awaiting:
+        sid = find_new_session(cfg, st, wave)
+        if sid:
+            w.setdefault("sessions", []).append(sid)
+            w["await_session"] = awaiting = False
+            event(cfg, f"{wave}: новая сессия привязана по метке")
+            save_state(cfg, st)
+    if awaiting:
+        tokens = w.get("tokens", 0)  # старый журнал не меряем: контрольную точку не запрашиваем
+    else:
+        tokens = context_tokens(w)
+        w["tokens"] = tokens
+        w["peak"] = max(w.get("peak", 0), tokens)
+        w["ctx_hist"] = (w.get("ctx_hist", []) + [tokens])[-120:]
 
-    if w["phase"] == "running" and tokens >= cfg["ctx_limit"]:
+    if w["phase"] == "running" and not awaiting and tokens >= cfg["ctx_limit"]:
         event(cfg, f"{wave}: контекст {tokens} >= {cfg['ctx_limit']}, запрошена контрольная точка")
         w["phase"] = "checkpoint"  # сначала сохраняем: перезапущенный watch обязан увидеть запрос
         w["checkpoint_at"] = now
@@ -916,6 +1255,12 @@ def tick(cfg, st, waves_json=None):
 
 
 def watch(cfg, path):
+    require_tmux()
+    with dispatcher_lock(cfg):  # на всё время слежения; снимается при выходе из процесса
+        _watch_loop(cfg, path)
+
+
+def _watch_loop(cfg, path):
     event(cfg, f"watch запущен, ctx_limit={cfg['ctx_limit']}")
     last, warned = 0.0, None
     while True:

@@ -68,12 +68,18 @@ def spark(values, limit, width=60):
 _stats_cache = {}
 
 
-def transcript_stats(cwd):
-    """Сводка по всем транскриптам рабочей копии волны (по файлу на каждый перезапуск /clear)."""
+def transcript_stats(cwd, sessions=None):
+    """Сводка по журналам сессий волны (по файлу на каждый перезапуск /clear) и их субагентам.
+
+    `sessions` — id сессий волны из state (тот же путь, что у wab.context_tokens): чужие журналы
+    каталога в сводку не попадают. None — запись без привязки (старый state): все журналы каталога."""
     if not cwd:  # волна зарезервирована launch, worktree ещё не готов
         return {"turns": 0, "tools": 0, "out": 0, "read": 0, "agents": 0}
     d = wab.transcript_dir(cwd)
     found = list(d.glob("*.jsonl")) + list(d.glob("*/subagents/*.jsonl")) if d.exists() else []
+    if sessions is not None:
+        mine = set(sessions)
+        found = [f for f in found if (f.stem if f.parent == d else f.parent.parent.name) in mine]
     stamped = []
     for f in found:  # транскрипт может исчезнуть между glob() и stat()
         try:
@@ -157,7 +163,7 @@ def waves_table(cfg, st):
         if not w:
             tb.add_row(Text(wave, style="grey50"), Text(f"{icon} {label}", style=colour), *[""] * 9)
             continue
-        s = transcript_stats(w["cwd"])
+        s = transcript_stats(w["cwd"], w.get("sessions"))
         end = w.get("finished") or now
         tb.add_row(
             Text(wave, style="bold"), Text(f"{icon} {label}", style=colour),
@@ -227,7 +233,7 @@ def header(cfg, st):
     done = sum(1 for w in wab.wave_ids(cfg) if wab.read(wab.wave_path(cfg, w) / "status") == "DONE")
     started = min((w["started"] for w in waves.values()), default=time.time())
     restarts = sum(w.get("restarts", 0) for w in waves.values())
-    turns = sum(transcript_stats(w["cwd"])["turns"] for w in waves.values())
+    turns = sum(transcript_stats(w["cwd"], w.get("sessions"))["turns"] for w in waves.values())
     t = Text(justify="center")
     t.append("🌊 wave-autobot ", style="bold bright_cyan")
     t.append(f"· {cfg['chain']} ", style="bold white")

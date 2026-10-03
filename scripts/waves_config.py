@@ -1,7 +1,7 @@
 """Загрузчик и валидатор единого конфига waves.json (версия 1).
 
 `load_waves(path)` возвращает новый dict с применёнными умолчаниями и производными полями
-`run_dir` и `tmux_prefix`. Каталогов он не создаёт. Любая проблема — `ConfigError`
+`run_dir`, `plan_path` и `tmux_prefix`. Каталогов он не создаёт. Любая проблема — `ConfigError`
 с сообщением вида `waves.json: waves[2].depends_on: …`.
 """
 import json
@@ -254,5 +254,6 @@ def load_waves(path):
     cfg["waves"] = waves
 
     cfg["run_dir"] = pathlib.Path(path).absolute().parent / "runs" / cfg["run_id"]
+    cfg["plan_path"] = cfg["run_dir"].parent.parent / "waves.md"  # план рядом с waves.json (для пина)
     cfg["tmux_prefix"] = f"wab-{cfg['chain']}-"
     return cfg

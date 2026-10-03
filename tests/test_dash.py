@@ -179,8 +179,8 @@ class TestPaneTextJoin(unittest.TestCase):
         with mock.patch.object(dash.wab, "sh", cap):
             self.assertEqual(dash.wab.pane_text("wab-c-w1", join=True), "склеено")
             self.assertEqual(dash.wab.pane_text("wab-c-w1"), "разрезано")
-        self.assertEqual(cap.calls, [["tmux", "capture-pane", "-p", "-J", "-t", "=wab-c-w1:"],
-                                     ["tmux", "capture-pane", "-p", "-t", "=wab-c-w1:"]])
+        self.assertEqual(cap.calls, [["tmux", "-u", "capture-pane", "-p", "-J", "-t", "=wab-c-w1:"],
+                                     ["tmux", "-u", "capture-pane", "-p", "-t", "=wab-c-w1:"]])
 
     def test_wait_ready_markers(self):
         for marker in dash.wab.READY_MARKERS:
@@ -199,7 +199,7 @@ class TestPaneTextJoin(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, out, "")
         with mock.patch.object(dash.wab, "sh", sh), mock.patch.object(dash.wab.time, "sleep"):
             self.assertTrue(dash.wab.wait_ready("wab-c-w1", timeout=5))
-        self.assertIn(["tmux", "send-keys", "-t", "=wab-c-w1:", "Down"], calls)
+        self.assertIn(["tmux", "-u", "send-keys", "-t", "=wab-c-w1:", "Down"], calls)
 
 
 @unittest.skipUnless(os.environ.get("WAB_LIVE_TMUX") == "1",

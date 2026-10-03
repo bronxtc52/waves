@@ -54,6 +54,7 @@ wab.tmux_alive = tmux_alive
 wab.prepare_worktree = prepare_worktree
 wab.sh = sh
 wab.wait_ready = lambda *a, **k: True
+wab.require_tmux = lambda: None
 wab.ensure_roles = lambda cfg, refresh=False: (dict(cfg["roles"]), {})
 wab.send_text = lambda *a, **k: None
 (sig / (wave + ".started")).write_text("1")

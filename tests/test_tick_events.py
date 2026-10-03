@@ -341,28 +341,23 @@ class TestBlockedLongStatus(_Base):
 
 
 class TestHandoffResume(_Base):
-    """HANDOFF_READY: /clear, пауза прототипа, ожидание поля ввода и продолжение обычным промптом без «/»."""
+    """HANDOFF_READY: машина фаз по тикам (checkpoint -> clearing -> resuming -> running);
+    каждое состояние на диске ДО действия, внутри tick нет долгого sleep и нет wait_ready."""
 
     def setUp(self):
         super().setUp()
         self.calls = []
-        rec = lambda kind: (lambda *a, **k: self.calls.append((kind,) + a))
+        rec = lambda kind: (lambda *a, **k: self.disk(kind, a))
         self.ready = True
-        self.n_pane = 0
-
-        def pane(*a, **k):
-            # каждый снимок отличается: признак «экран сменился» не должен заменять паузу
-            self.n_pane += 1
-            self.calls.append(("pane",) + a)
-            return f"экран {self.n_pane}\n? for shortcuts"
+        self.screen = "экран\n? for shortcuts"
+        self.disk_at = []  # что лежало в state.json в момент каждого внешнего действия
 
         for name, kw in (("tmux_alive", {"return_value": True}),
-                         ("pane_text", {"side_effect": pane}),
+                         ("pane_text", {"side_effect": lambda *a, **k: self.screen}),
                          ("send_command", {"side_effect": rec("command")}),
                          ("send_text", {"side_effect": rec("text")}),
                          ("send_keys", {"side_effect": rec("keys")}),
-                         ("wait_ready", {"side_effect": lambda *a, **k: (self.calls.append(("ready",) + a),
-                                                                         self.ready)[1]})):
+                         ("wait_ready", {"side_effect": rec("wait_ready")})):
             pt = mock.patch.object(wab, name, **kw)
             pt.start()
             self.addCleanup(pt.stop)
@@ -370,72 +365,117 @@ class TestHandoffResume(_Base):
         sleep.start()
         self.addCleanup(sleep.stop)
 
-    def run_handoff(self, wave="W1"):
-        wdir = wab.wave_dir(self.cfg, wave)
-        (wdir / "status").write_text("HANDOFF_READY\n", encoding="utf-8")
-        st = {"current": wave, "waves": {wave: {"tmux": f"wab-demo-{wave}", "phase": "checkpoint",
-                                                "restarts": 2, "notified": {}, "checkpoint_at": 1.0}}}
+    def disk(self, kind, args):
+        self.calls.append((kind,) + args)
+        p = wab.state_path(self.cfg)
+        self.disk_at.append((kind, wab.load_state(self.cfg)["waves"]["W1"].copy() if p.exists() else None))
+
+    def state(self, phase="checkpoint", **extra):
+        w = {"tmux": "wab-demo-W1", "cwd": str(self.dir), "phase": phase, "restarts": 2,
+             "notified": {}, "checkpoint_at": 1.0, "checkpoint_sent": True, "sessions": ["s0"], **extra}
+        return {"current": "W1", "waves": {"W1": w}}
+
+    def tick(self, st, status="HANDOFF_READY"):
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text(status + "\n", encoding="utf-8")
+        wab.save_state(self.cfg, st)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(wab.tick(self.cfg, st))
-        return st, wdir
+        return st["waves"]["W1"], wdir
 
-    def test_settle_constant(self):
-        self.assertEqual(getattr(wab, "CLEAR_SETTLE_SECONDS", None), 6)
-        self.assertFalse(hasattr(wab, "wait_changed"))
+    def kinds(self):
+        return [c[0] for c in self.calls]
 
-    def test_clear_pause_wait_then_plain_prompt(self):
-        st, wdir = self.run_handoff()
-        calls = [c for c in self.calls if c[0] != "pane"]
-        kinds = [c[0] for c in calls]
-        self.assertEqual(kinds, ["command", "sleep", "ready", "text"])
-        self.assertEqual(calls[0][1:], ("wab-demo-W1", "/clear"))
-        self.assertEqual(calls[1][1:], (wab.CLEAR_SETTLE_SECONDS,))
-        self.assertEqual(calls[2][1], "wab-demo-W1")
-        text = calls[3][2]
-        self.assertFalse(text.lstrip().startswith("/"), text)
-        self.assertNotIn("/update", text)
-        self.assertIn(f"{wdir}/handoff.md", text)
-        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RESUMING")
-        w = st["waves"]["W1"]
-        self.assertEqual((w["restarts"], w["phase"]), (3, "running"))
-        self.assertIsNone(w["checkpoint_at"])
+    def test_first_tick_saves_clearing_then_sends_clear_no_sleep(self):
+        w, _ = self.tick(self.state())
+        self.assertEqual(self.kinds(), ["command"])
+        self.assertEqual(self.calls[0][1:], ("wab-demo-W1", "/clear"))
+        before = self.disk_at[0][1]
+        self.assertEqual((before["phase"], before["clear_sent"]), ("clearing", False))
+        self.assertIn("clear_at", before)
+        self.assertEqual((w["phase"], w["clear_sent"]), ("clearing", True))
         saved = wab.load_state(self.cfg)["waves"]["W1"]
-        self.assertEqual((saved["restarts"], saved["phase"]), (3, "running"))
+        self.assertEqual((saved["phase"], saved["clear_sent"]), ("clearing", True))
+        self.assertEqual(w["restarts"], 2)
+
+    def test_no_wait_ready_and_no_long_sleep_in_any_tick(self):
+        import time as _t
+        st = self.state()
+        self.tick(st)
+        st["waves"]["W1"]["clear_at"] = _t.time() - 10
+        self.tick(st)
+        self.assertNotIn("wait_ready", self.kinds())
+        for c in self.calls:
+            if c[0] == "sleep":
+                self.assertLessEqual(c[1], 1.0)
+
+    def test_before_settle_nothing_happens(self):
+        import time as _t
+        w, _ = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time()))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(w["phase"], "clearing")
+
+    def test_ready_after_settle_resumes_with_marker(self):
+        import time as _t
+        w, wdir = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - wab.CLEAR_SETTLE_SECONDS - 1))
+        self.assertEqual(self.kinds(), ["text"])
+        text = self.calls[0][2]
+        self.assertTrue(text.startswith(wab.session_marker(self.cfg, "W1")), text)
+        self.assertFalse(text.startswith("/"))
+        self.assertIn(f"{wdir}/handoff.md", text)
+        self.assertNotIn("/update", text)
+        # на диске в момент отправки — resuming
+        self.assertEqual(self.disk_at[0][1]["phase"], "resuming")
+        self.assertEqual((w["phase"], w["restarts"], w["await_session"]), ("running", 3, True))
+        self.assertIsNone(w["checkpoint_at"])
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RESUMING")
+        saved = wab.load_state(self.cfg)["waves"]["W1"]
+        self.assertEqual((saved["phase"], saved["restarts"], saved["await_session"]), ("running", 3, True))
         self.assertIn("W1: handoff готов, /clear и продолжение (перезапуск №3)", self.log())
 
-    def test_ready_never_checked_before_settle_pause(self):
-        # пауза обязательна: даже если экран сразу сменился, wait_ready — только после sleep(>= паузы)
-        self.run_handoff()
-        kinds = [c[0] for c in self.calls]
-        i_cmd, i_ready = kinds.index("command"), kinds.index("ready")
-        paused = sum(c[1] for c in self.calls[i_cmd:i_ready] if c[0] == "sleep")
-        self.assertGreaterEqual(paused, 6)
-        self.assertGreaterEqual(paused, getattr(wab, "CLEAR_SETTLE_SECONDS", 6))
-        self.assertLess(i_ready, kinds.index("text"))
+    def test_trust_dialog_accepted_without_loop(self):
+        import time as _t
+        self.screen = wab.TRUST_MARKERS[0]
+        w, _ = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - 10))
+        keys = [c[2] for c in self.calls if c[0] == "keys"]
+        self.assertEqual(keys, ["Down", "Enter"])
+        self.assertNotIn("text", self.kinds())
+        self.assertEqual(w["phase"], "clearing")
 
-    def test_prompt_never_starts_with_slash(self):
-        for wave in self.cfg["waves"]:
-            wid = wave["id"] if isinstance(wave, dict) else wave
-            self.calls.clear()
-            self.run_handoff(wid)
-            texts = [c[2] for c in self.calls if c[0] == "text"]
-            self.assertEqual(len(texts), 1)
-            self.assertFalse(texts[0].startswith("/"), texts[0])
+    def test_restart_in_clearing_resends_clear_only_if_unsent(self):
+        import time as _t
+        self.tick(self.state("clearing", clear_sent=False, clear_at=_t.time() - 100))
+        self.assertEqual(self.kinds(), ["command"])
+        self.calls.clear()
+        self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time()))
+        self.assertEqual(self.calls, [])
 
-    def test_not_ready_after_clear_blocks_without_prompt(self):
-        self.ready = False
-        st, wdir = self.run_handoff()
-        kinds = [c[0] for c in self.calls]
-        self.assertNotIn("text", kinds)
-        self.assertIn("ready", kinds)
+    def test_not_ready_after_90s_blocks_without_prompt(self):
+        import time as _t
+        self.screen = "пусто"
+        w, wdir = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - 95))
+        self.assertNotIn("text", self.kinds())
+        self.assertEqual(w["phase"], "not_ready")
         status = (wdir / "status").read_text(encoding="utf-8").strip()
         self.assertEqual(status, "BLOCKED: окно Claude не стало готовым после /clear, продолжение не отправлено")
-        w = st["waves"]["W1"]
-        self.assertEqual((w["restarts"], w["phase"]), (2, "not_ready"))
-        saved = wab.load_state(self.cfg)["waves"]["W1"]
-        self.assertEqual((saved["restarts"], saved["phase"]), (2, "not_ready"))
+        self.assertEqual(w["restarts"], 2)
         self.assertIn("W1: BLOCKED", self.log())
         self.assertNotIn("перезапуск", self.log())
+
+    def test_not_ready_yet_within_90s_waits(self):
+        import time as _t
+        self.screen = "пусто"
+        w, _ = self.tick(self.state("clearing", clear_sent=True, clear_at=_t.time() - 30))
+        self.assertEqual((w["phase"], self.calls), ("clearing", []))
+
+    def test_restart_in_resuming_never_resends_blindly(self):
+        w, wdir = self.tick(self.state("resuming", clear_sent=True, clear_at=1.0))
+        self.assertEqual(self.kinds(), [])
+        self.assertEqual(w["phase"], "not_ready")
+        status = (wdir / "status").read_text(encoding="utf-8")
+        self.assertIn("BLOCKED", status)
+        self.assertIn("продолжение могло не дойти", status)
+        self.assertIn("W1: BLOCKED", self.log())
 
 
 class TestNotReadyRecovery(_Base):
