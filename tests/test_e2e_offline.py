@@ -233,6 +233,10 @@ class _E2E(unittest.TestCase):
                     p.wait(5)
         subprocess.run([TMUX, "-L", self.socket, "kill-server"], capture_output=True,
                        env={k: v for k, v in os.environ.items() if k != "TMUX"})
+        # сервер, вышедший сам (сессий не осталось), оставляет файл сокета: убираем ровно свой
+        sock = pathlib.Path(os.environ.get("TMUX_TMPDIR") or "/tmp") / f"tmux-{os.getuid()}" / self.socket
+        if sock.is_socket():
+            sock.unlink()
 
     # ---------- процессы диспетчера ----------
     def launch_w1(self):

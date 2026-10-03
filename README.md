@@ -177,7 +177,7 @@ python3 "$WAB"/scripts/dash.py waves.json
 
 ## Команды
 
-Все — `python3 "$WAB"/scripts/<скрипт> …`.
+Python-скрипты запускаются как `python3 "$WAB"/scripts/<скрипт> …`, `wab-open` — напрямую: `"$WAB"/scripts/wab-open`.
 
 | Команда | Что делает |
 |---|---|
