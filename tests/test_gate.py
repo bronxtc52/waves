@@ -220,6 +220,21 @@ class TestFindPr(_Cfg):
         self.assertEqual(gate.find_pr(REPO, "b", "main", FakeRun(prs=prs))["number"], 5)
         self.assertFalse([c for c in fake.calls if c[:2] == ["gh", "api"]], "для MERGED check-runs не нужны")
 
+    def test_merged_ignores_local_git_errors(self):
+        # для MERGED локальные факты не нужны: сломанный git рабочей копии не превращает merged в wait
+        fake = FakeRun(prs=[pr(5, "MERGED", merged_at="2026-10-02T00:00:00Z")],
+                       overrides={"rev-parse": (128, "", "fatal: not a git repository"),
+                                  "status": (128, "", "fatal")})
+        verdict, reasons = self.gate(fake)
+        self.assertEqual(verdict, "merged", reasons)
+        self.assertFalse([c for c in fake.calls if c[:1] == ["git"]], "git для MERGED не вызывается")
+
+    def test_merged_plan_still_fails(self):
+        self.pin(b"plan v1\n", file_text=b"x")
+        fake = FakeRun(prs=[pr(5, "MERGED", merged_at="2026-10-02T00:00:00Z")],
+                       overrides={"rev-parse": (128, "", "fatal")})
+        self.assertEqual(self.gate(fake)[0], "fail")
+
     def test_closed_fail(self):
         verdict, reasons = self.gate(FakeRun(prs=[pr(4, "CLOSED")]))
         self.assertEqual(verdict, "fail")

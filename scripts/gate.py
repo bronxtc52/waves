@@ -220,6 +220,7 @@ def collect_facts(cfg, branch, cwd, run=default_run, base="main"):
 
     Ключи: pr (dict|None), duplicate (текст|None), local_head, tree_clean, checks (список|None —
     PR нет, закрыт или смержен: для MERGED check-runs не нужны), plan (None|причина), errors.
+    Для MERGED локальные факты (HEAD, дерево) не собираются: local_head и tree_clean остаются None.
     """
     facts = {"pr": None, "duplicate": None, "local_head": None, "tree_clean": None, "checks": None,
              "plan": plan_problem(cfg), "errors": []}
@@ -229,11 +230,15 @@ def collect_facts(cfg, branch, cwd, run=default_run, base="main"):
         facts["duplicate"] = str(e)
     except GateError as e:
         facts["errors"].append(str(e))
+    p = facts["pr"]
+    if p and p.get("state") == "MERGED":
+        # смержено на GitHub: HEAD и дерево рабочей копии волны уже ничего не решают, а сломанный
+        # локальный git не должен держать волну в wait (пин плана выше при этом в силе)
+        return facts
     try:
         facts["local_head"], facts["tree_clean"] = local_facts(cwd, run)
     except GateError as e:
         facts["errors"].append(str(e))
-    p = facts["pr"]
     if p and p.get("state") == "OPEN" and p.get("headRefOid"):
         try:
             facts["checks"] = check_runs(cfg["repo"], p["headRefOid"], run)

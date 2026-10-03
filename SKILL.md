@@ -54,15 +54,22 @@ WAB="${WAB:-$HOME/.claude/skills/wave-autobot}"
    - `python3 "$WAB"/scripts/wab.py models waves.json` — проверить доступность моделей ролей
      (недоступная заменяется на `fallback_model`; `--refresh` проверяет заново);
    - `python3 "$WAB"/scripts/wab.py launch waves.json W1 prompt-W1.md` — запустить волну;
-   - `python3 "$WAB"/scripts/wab.py watch waves.json` — следить до `DONE` (второй `watch` на тот же
-     прогон не стартует: блокировка `dispatcher.lock`);
+   - `python3 "$WAB"/scripts/wab.py watch waves.json` — вести цепочку: гейт после `DONE`, мердж
+     (свой или человека), запуск следующей волны (второй `watch` на тот же прогон не стартует:
+     блокировка `dispatcher.lock`);
    - `python3 "$WAB"/scripts/dash.py waves.json` — дашборд, в отдельном окне tmux.
 
 ## Фаза B — ход волн
 
 Диспетчер ведёт одну волну за раз. Он перезапускает сессию со свежим контекстом по handoff, когда
-контекст заполнен, замечает простой и вопрос `BLOCKED`. После `DONE` закрывает окно и печатает
-команду `launch` для следующей волны: мердж PR и решение о продолжении — за человеком.
+контекст заполнен, замечает простой и вопрос `BLOCKED`. После `DONE` — гейт мерджа: PR ветки
+волны, HEAD волны = HEAD PR, чистое дерево, все check-runs строго `success`, пин плана. Отказ —
+`BLOCKED: merge gate: <причина>` в `status` и та же причина в окно волны (волна исправляет и снова
+пишет `DONE`); изменённый план — `BLOCKED: plan changed since approval`. Пройден: при
+`automerge: false` (по умолчанию) волна ждёт, пока PR смержит человек; при `automerge: true`
+диспетчер сам делает один `gh pr merge --squash --match-head-commit <sha>`. После MERGED и проверки,
+что merge-коммит есть в `origin/<base_branch>`, окно закрывается и диспетчер **сам запускает**
+следующую волну по её `next-prompt.md`. Итог цепочки — `chain-result.md` в каталоге прогона.
 Человек видит дашборд (волны, контекст, события, роли и fallback) и подключается к окну волны
 через `tmux attach`, когда волна пишет `BLOCKED`.
 Вычистка секретов из событий и дашборда (`redact`) работает шаблонами: известные формы ключей, токенов,
