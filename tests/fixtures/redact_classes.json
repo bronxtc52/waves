@@ -120,5 +120,35 @@
   "tool --token-budget 5 --password-file /tmp/x --no-secret-scan",
   "see user@ for details and a @ b",
   "подсказка: пароль хранится в хранилище"
+ ],
+ "escape_levels": [
+  {
+   "text": "{\\\"password\\\": \\\"pa\\\\\\\"ssWordTail\\\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "x {\\\"user\\\": \\\"bob\\\", \\\"token\\\": \\\"to\\\\\\\"kenTail\\\", \\\"n\\\": 1}",
+   "secret": "kenTail"
+  },
+  {
+   "text": "{\"password\": \"pa\\\"ssWordTail\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "{\\\\\\\"password\\\\\\\": \\\\\\\"pa\\\\\\\\\\\\\\\"ssWordTail\\\\\\\"}",
+   "secret": "ssWordTail"
+  },
+  {
+   "text": "{\"password\": \"ab\\\\\\\\\"}, tail",
+   "secret": "ab"
+  },
+  {
+   "text": "{\\\"password\\\": \\\"ab\\\\\\\\cdSecretTail\\\", \\\"n\\\": 1}",
+   "secret": "cdSecretTail"
+  },
+  {
+   "text": "{\\\"password\\\": \\\"pa\\\\\\\"ss\\\\\\\\\\\\\\\"WordTail\\\"}",
+   "secret": "WordTail"
+  }
  ]
 }

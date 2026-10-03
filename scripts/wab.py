@@ -459,6 +459,17 @@ def find_new_session(cfg, st, wave):
 # Всё, что выходит за пределы каталога волны, пропускается через redact().
 REDACT_LIMIT = 600           # цитата из текста волны (result.md, вопрос BLOCKED)
 REDACT_MESSAGE_LIMIT = 1200  # сообщение целиком; цитату сначала режем до REDACT_LIMIT
+
+def _esc_quoted(d):
+    """Значение в кавычках на уровне экранирования: разделитель — d обратных слешей и «"» (d=1 — JSON в строке,
+    d=3 — двойная вложенность). Закрывает значение ровно разделитель своего уровня; кавычка с большим числом
+    слешей — часть значения, с меньшим — тоже. Серии слешей берутся целиком, поэтому шаблон линеен."""
+    parts = [r'[^"\\]', r'\\+(?![\\"])', r'\\{%d,}"' % (d + 1)]
+    if d > 1:
+        parts.append(r'\\{1,%d}"' % (d - 1))
+    return r'\\{%d}"(?:%s)*(?:\\{%d}")?' % (d, "|".join(parts), d)
+
+
 _REDACT = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
     # Слева у префиксных шаблонов нет \b: секрет может быть приклеен к пути или слову
@@ -484,8 +495,8 @@ _REDACT = [
                r"([A-Za-z0-9_-]*(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|passphrase|dsn|"
                r"connection[_-]?string|accountkey|sharedaccesskey)"
                r"(?:[_-](?:key|hash|secret|value|token|access|digest|salt))*)\b"
-               r"(\\?[\"']?\s*(?:=>|[:=])\s*)"
-               r"(?:\\\"(?:[^\"\\]|\\(?!\"))*(?:\\\")?|\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|\S*[^\s,)\]}])"),
+               r"(\\*[\"']?\s*(?:=>|[:=])\s*)"
+               r"(?:" + _esc_quoted(3) + "|" + _esc_quoted(1) + r"|\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|\S*[^\s,)\]}])"),
     # флаг командной строки со значением через пробел: --password x, --api-key "a b"
     re.compile(r"(?i)(?<![A-Za-z0-9_-])(--[A-Za-z0-9-]*(?:password|passwd|pwd|secret|token|api-?key|private-?key|"
                r"passphrase)(?:-(?:key|hash|secret|value|token|digest|salt))*)(?=\s)(\s+)"

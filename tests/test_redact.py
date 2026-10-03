@@ -133,6 +133,49 @@ class TestRedactClasses(unittest.TestCase):
                          "mysql --user bob --password [скрыто] --host db")
 
 
+class TestRedactEscapeLevels(unittest.TestCase):
+    """Закрывающая кавычка значения — ровно разделитель своего уровня экранирования (W3-r2): ни секрет,
+    ни его хвост не доходят до event() (events.log, экран) и до экрана дашборда."""
+
+    def examples(self):
+        return FIXTURE["escape_levels"]
+
+    def test_redact_hides_value_and_tail(self):
+        for ex in self.examples():
+            with self.subTest(text=ex["text"]):
+                out = wab.redact(ex["text"], limit=10_000)
+                self.assertNotIn(ex["secret"], out)
+                self.assertIn("password" if "password" in ex["text"] else "token", out)
+                self.assertIn("[скрыто]", out)
+
+    def test_names_and_neighbours_survive(self):
+        out = wab.redact(r'{\"user\": \"bob\", \"token\": \"to\\\"kenTail\", \"n\": 1}', limit=10_000)
+        self.assertIn(r'\"user\": \"bob\"', out)
+        self.assertIn("token", out)
+        self.assertNotIn("kenTail", out)
+        self.assertIn(r'\"n\": 1', out)
+
+    def test_event_log_and_screen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = wab.load_waves(str(write_json(pathlib.Path(tmp), good())))
+            for ex in self.examples():
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    wab.event(cfg, "W1: BLOCKED: " + ex["text"])
+                log = (cfg["run_dir"] / "events.log").read_text(encoding="utf-8")
+                self.assertNotIn(ex["secret"], out.getvalue(), ex["text"])
+                self.assertNotIn(ex["secret"], log, ex["text"])
+
+    def test_dash_screen_text(self):
+        dash = import_dash()  # без rich — с заглушками; рендер тут не нужен, только вычистка
+        pane = "работаю\n" + "\n".join(ex["text"] for ex in self.examples()) + "\nготово\n"
+        with mock.patch.object(dash.wab, "pane_text", return_value=pane):
+            text = dash.screen_text("wab-W1", rows=100, width=500)
+        for ex in self.examples():
+            self.assertNotIn(ex["secret"], text, ex["text"])
+        self.assertIn("готово", text)
+
+
 class TestRedactLinear(unittest.TestCase):
     """Шаблоны не должны вести себя квадратично: до W3 300 КБ без «@» занимали ~115 с."""
 
@@ -163,3 +206,10 @@ class TestRedactLinear(unittest.TestCase):
         self.assertLess(self.timed("sk-" * 100_000), 1.0)
         self.assertLess(self.timed("a_" * 150_000), 1.0)
         self.assertLess(self.timed("x-" * 150_000 + "password"), 1.0)
+
+    def test_300kb_escaped_quote_runs(self):
+        head = r'{\"password\": \"'
+        self.assertLess(self.timed(head + r'\\\"' * 50_000 + r'\"' * 50_000), 1.0)
+        self.assertLess(self.timed(head + (r'\\\"\"' * 37_500)), 1.0)
+        self.assertLess(self.timed('password="' + r'\\\\\"' * 50_000), 1.0)
+        self.assertLess(self.timed('password=' + "\\" * 300_000), 1.0)
