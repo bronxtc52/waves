@@ -29,7 +29,7 @@ class IgnoreQuit(unittest.TestCase):
     def test_dash_main_ignores_sigquit_first(self):
         try:
             import dash
-        except SystemExit:  # нет rich: dash.py выходит на импорте — проверка не применима
+        except (SystemExit, ImportError):  # нет rich: dash.py выходит или падает на импорте — не применимо
             self.skipTest("dash.py требует rich")
         with mock.patch.object(wab.signal, "signal") as sig, mock.patch.object(sys, "argv", ["dash.py"]):
             with self.assertRaises(SystemExit):
