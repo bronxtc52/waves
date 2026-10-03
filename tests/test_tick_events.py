@@ -38,6 +38,7 @@ class TestDone(_Base):
         self.sent = []
         for name, kw in (("send_keys", {"side_effect": lambda *a, **k: self.sent.append(a)}),
                          ("tmux_alive", {"return_value": True}),
+                         ("require_tmux", {"return_value": None}),   # watch() проверяет tmux; на CI-раннере его может не быть
                          ("launch", {"return_value": True})):
             pt = mock.patch.object(wab, name, **kw)
             setattr(self, "m_" + name, pt.start())

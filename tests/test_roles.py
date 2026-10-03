@@ -341,6 +341,10 @@ class TestNoticesOnce(Tmp):
         p = mock.patch.object(wab, "probe_model", self.probe)
         p.start()
         self.addCleanup(p.stop)
+        # версия tmux здесь не предмет проверки: на CI-раннере tmux может не быть
+        p = mock.patch.object(wab, "require_tmux", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_refresh_does_not_repeat_event(self):
         wab.ensure_roles(self.cfg)
