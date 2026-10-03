@@ -272,6 +272,20 @@ class TestAutomerge(_Flow):
         self.assertEqual(self.w()["gate"]["verdict"], "wait")
         self.assertNotIn("merge", self.w())
 
+    def test_plan_changed_before_ready_no_ready_no_merge(self):
+        self.pin_plan()
+        self.gh.draft = True
+        orig = Gh.__call__
+
+        def gh(argv):
+            if argv[:3] == ["gh", "pr", "view"]:   # head_still — сразу перед ready/merge
+                (self.dir / "waves.md").write_bytes(b"plan v2\n")
+            return orig(self.gh, argv)
+        self.m_gate_run.side_effect = gh
+        self.tick("DONE")
+        self.assertEqual([c for c in self.gh.calls if c[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"])], [])
+        self.assertTrue(self.status().startswith("BLOCKED: plan changed since approval:"))
+
     def test_draft_is_readied_first(self):
         self.gh.draft = True
         self.tick("DONE")
@@ -296,6 +310,61 @@ class TestAutomerge(_Flow):
         self.assertEqual(self.w()["merge"]["sha"], SHA)
         self.tick("DONE")
         self.assertEqual(len(self.gh.merges()), 1)
+
+
+TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+
+def leaks(text):
+    return [TOKEN[i:i + 8] for i in range(0, len(TOKEN) - 8) if TOKEN[i:i + 8] in text]
+
+
+class TestRedactBeforeCut(_Flow):
+    automerge = True
+
+    def straddle(self, prefix):
+        """stderr, в котором токен пересекает границу gate.ERROR_LIMIT полного текста ошибки."""
+        import gate
+        pad = gate.ERROR_LIMIT - len(prefix) - 10
+        return "x" * pad + " " + TOKEN + " хвост"
+
+    def everywhere(self):
+        st = wab.load_state(self.cfg)
+        return self.log() + self.status() + json.dumps(st, ensure_ascii=False) + \
+            "".join(t for _, t in self.texts)
+
+    def test_gh_error_token_on_boundary(self):
+        err = self.straddle("gh api --paginate: код 1: ")
+        orig = Gh.__call__
+
+        def gh(argv):
+            if argv[:2] == ["gh", "api"]:
+                return 1, "", err
+            return orig(self.gh, argv)
+        self.m_gate_run.side_effect = gh
+        self.tick("DONE")
+        self.assertEqual(self.w()["gate"]["verdict"], "wait")
+        self.assertEqual(leaks(self.everywhere()), [])
+
+    def test_merge_stderr_token_on_boundary(self):
+        self.gh.merge_rc, self.gh.merge_err = 1, self.straddle("")
+        self.tick("DONE")
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: gh pr merge отказал"))
+        self.assertEqual(leaks(self.everywhere()), [])
+
+    def test_ready_stderr_token_on_boundary(self):
+        self.gh.draft = True
+        orig = Gh.__call__
+
+        def gh(argv):
+            if argv[:3] == ["gh", "pr", "ready"]:
+                self.gh.calls.append(list(argv))
+                return 1, "", self.straddle("")
+            return orig(self.gh, argv)
+        self.m_gate_run.side_effect = gh
+        self.tick("DONE")
+        self.assertTrue(self.status().startswith("BLOCKED: merge gate: gh pr ready отказал"))
+        self.assertEqual(leaks(self.everywhere()), [])
 
 
 class TestMergeVerify(_Flow):
@@ -393,6 +462,55 @@ class TestGateFail(_Flow):
         self.assertEqual(len(self.w()["questions"]), 20)
 
 
+class TestLaunchReservationPending(unittest.TestCase):
+    """Настоящий launch: pending_launch снимается в той же блокировке, где резервируется волна."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = pathlib.Path(self._tmp.name)
+        self.cfg = wab.load_waves(str(write_json(self.dir, good())))
+        self.prompt = self.dir / "next.md"
+        self.prompt.write_text("дальше\n", encoding="utf-8")
+        roles = helpers.stub_ensure_roles(wab)
+        roles.start()
+        self.addCleanup(roles.stop)
+        for name, kw in (("tmux_alive", {"return_value": False}), ("sh", {"return_value": None}),
+                         ("send_text", {"return_value": None}),
+                         ("wait_ready", {"return_value": False}),
+                         ("prepare_worktree", {"return_value": str(self.dir / "wt")})):
+            pt = mock.patch.object(wab, name, **kw)
+            setattr(self, "r_" + name, pt.start())
+            self.addCleanup(pt.stop)
+        wab.save_state(self.cfg, {"current": None, "waves": {},
+                                  "pending_launch": {"wave": "W2", "prompt": str(self.prompt), "after": "W1"}})
+
+    def launch(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return wab.launch(self.cfg, "W2", str(self.prompt))
+
+    def test_reservation_removes_pending(self):
+        self.assertFalse(self.launch())       # окно не готово — резерв уже сделан
+        saved = wab.load_state(self.cfg)
+        self.assertEqual(saved["current"], "W2")
+        self.assertNotIn("pending_launch", saved)
+
+    def test_failed_launch_after_reservation_restores_pending(self):
+        self.r_prepare_worktree.side_effect = SystemExit("worktree не готов")
+        with self.assertRaises(SystemExit):
+            self.launch()
+        saved = wab.load_state(self.cfg)
+        self.assertIsNone(saved["current"])
+        self.assertEqual(saved["pending_launch"]["wave"], "W2")
+
+    def test_other_wave_pending_untouched(self):
+        st = wab.load_state(self.cfg)
+        st["pending_launch"]["wave"] = "W1"
+        wab.save_state(self.cfg, st)
+        self.launch()
+        self.assertEqual(wab.load_state(self.cfg)["pending_launch"]["wave"], "W1")
+
+
 class TestPendingLaunch(_Flow):
     def lock_free(self):
         fd = os.open(self.cfg["run_dir"] / "state.lock", os.O_RDWR | os.O_CREAT, 0o644)
@@ -408,11 +526,25 @@ class TestPendingLaunch(_Flow):
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(wab.time, "sleep"):
             wab._watch_loop(self.cfg, str(self.cfg_path))
 
+    def reserve(self, cfg, wave, prompt):
+        """Как резерв настоящего launch: под run_lock снять pending_launch этой волны, current = wave.
+        Окно новой волны «мёртвое», чтобы watch остановился на следующем такте."""
+        with wab.run_lock(cfg):
+            st = wab.load_state(cfg)
+            if (st.get("pending_launch") or {}).get("wave") == wave:
+                st.pop("pending_launch")
+            st["current"] = wave
+            st["waves"][wave] = {"tmux": f"wab-demo-{wave.lower()}", "cwd": None, "phase": "running",
+                                 "restarts": 0, "notified": {}, "started": 1.0}
+            wab.save_state(cfg, st)
+        self.alive = False
+        return True
+
     def test_launch_outside_run_lock_after_merge(self):
         seen = []
         self.m_launch.side_effect = lambda cfg, wave, prompt: (seen.append((wave, prompt, self.lock_free(),
                                                                           wab.load_state(cfg).get("pending_launch")))
-                                                              or False)
+                                                              or self.reserve(cfg, wave, prompt))
         self.gh.state = "MERGED"
         wdir = wab.wave_dir(self.cfg, "W1")
         (wdir / "status").write_text("DONE\n", encoding="utf-8")
@@ -423,13 +555,15 @@ class TestPendingLaunch(_Flow):
         wave, prompt, free, pending = seen[0]
         self.assertEqual((wave, prompt), ("W2", str(wdir / "next-prompt.md")))
         self.assertTrue(free, "launch вызван под run_lock")
-        self.assertIsNone(pending, "pending_launch снят до вызова launch")
+        # watch pending_launch не снимает: его снимает резерв launch под своим run_lock
+        self.assertEqual((pending or {}).get("wave"), "W2")
         self.assertIn("запускаю W2", self.log())
+        self.assertNotIn("pending_launch", wab.load_state(self.cfg))
 
     def test_restart_with_pending_launches(self):
         st = {"current": None, "waves": {}, "pending_launch": {"wave": "W2", "prompt": "/x/next.md", "after": "W1"}}
         wab.save_state(self.cfg, st)
-        self.m_launch.return_value = False
+        self.m_launch.side_effect = self.reserve
         self.run_watch()
         self.m_launch.assert_called_once_with(mock.ANY, "W2", "/x/next.md")
         self.assertNotIn("pending_launch", wab.load_state(self.cfg))
@@ -440,6 +574,61 @@ class TestPendingLaunch(_Flow):
         self.m_launch.side_effect = SystemExit("BLOCKED: plan changed since approval: sha256 …")
         self.run_watch()
         self.assertIn("BLOCKED: plan changed since approval", self.log())
+        self.assertIn("watch остановлен", self.log())
+        # pending_launch остаётся: рестарт watch попробует снова
+        self.assertEqual(wab.load_state(self.cfg)["pending_launch"]["wave"], "W2")
+
+    def merged_w1_on_disk(self):
+        self.gh.state = "MERGED"
+        wdir = wab.wave_dir(self.cfg, "W1")
+        (wdir / "status").write_text("DONE\n", encoding="utf-8")
+        (wdir / "next-prompt.md").write_text("дальше\n", encoding="utf-8")
+        wab.save_state(self.cfg, self.st)
+        return wdir
+
+    def test_crash_after_merge_save_restart_launches_once(self):
+        """Остановка сразу после сохранения «волна смержена»: намерение перехода уже на диске."""
+        self.merged_w1_on_disk()
+
+        def crash(*a, **k):
+            raise RuntimeError("диспетчер убит")
+        self.m_send_keys.side_effect = crash   # /exit — первое действие после сохранения
+        with self.assertRaises(RuntimeError):
+            self.run_watch()
+        saved = wab.load_state(self.cfg)
+        self.assertIsNone(saved["current"])
+        self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
+        self.assertEqual(saved["pending_launch"]["wave"], "W2")
+        self.m_send_keys.side_effect = lambda *a, **k: None
+        self.m_launch.side_effect = self.reserve
+        self.run_watch()
+        self.m_launch.assert_called_once()
+        self.assertEqual(wab.load_state(self.cfg)["current"], "W2")
+
+    def test_crash_before_reservation_restart_launches_once(self):
+        self.merged_w1_on_disk()
+
+        def crash(cfg, wave, prompt):
+            raise RuntimeError("диспетчер убит до резерва")
+        self.m_launch.side_effect = crash
+        with self.assertRaises(RuntimeError):
+            self.run_watch()
+        self.assertEqual(wab.load_state(self.cfg)["pending_launch"]["wave"], "W2")
+        self.m_launch.reset_mock()
+        self.m_launch.side_effect = self.reserve
+        self.run_watch()
+        self.m_launch.assert_called_once()
+        saved = wab.load_state(self.cfg)
+        self.assertEqual(saved["current"], "W2")
+        self.assertNotIn("pending_launch", saved)
+
+    def test_launch_without_reservation_does_not_spin(self):
+        st = {"current": None, "waves": {}, "pending_launch": {"wave": "W2", "prompt": "/x/next.md", "after": "W1"}}
+        wab.save_state(self.cfg, st)
+        self.m_launch.return_value = False
+        with helpers.deadline(10):
+            self.run_watch()
+        self.m_launch.assert_called_once()
         self.assertIn("watch остановлен", self.log())
 
     def test_tick_without_current_and_pending_false(self):

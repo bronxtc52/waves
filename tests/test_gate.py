@@ -176,7 +176,9 @@ class TestPagination(_Cfg):
     def test_gh_api_error_wait(self):
         verdict, reasons = self.gate(FakeRun(overrides={("gh", "api"): (1, "", "HTTP 502 " + "x" * 2000)}))
         self.assertEqual(verdict, "wait")
-        self.assertTrue(all(len(r) <= 400 for r in reasons), reasons)
+        # gate не усекает: обрывок токена на границе среза ушёл бы мимо redact; режет вызывающий после redact
+        self.assertTrue(any(len(r) > 2000 for r in reasons), reasons)
+        self.assertTrue(all("\n" not in r for r in reasons))
 
 
 class TestFindPr(_Cfg):

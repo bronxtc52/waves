@@ -97,12 +97,20 @@ class TestStatusLine(_Dash):
         st = self.st("gate", "DONE", gate={"verdict": "wait",
                                            "reasons": ["#{pane_title} #[fg=red] " + TOKEN + " x" * 80]})
         line = dash.status_line(self.cfg, st)
-        self.assertLessEqual(len(line), 80)
+        self.assertLessEqual(len(line), dash.STATUS_LINE_MAX)
+        self.assertEqual(dash.STATUS_LINE_MAX, 40)   # = status-right-length tmux по умолчанию
         self.assertNotIn("\n", line)
         self.assertNotIn(TOKEN[:12], line)
         # каждая «#» удвоена: после снятия пар одиночных не остаётся
         self.assertNotIn("#", line.replace("##", ""))
         self.assertIn("##{", line)
+
+    def test_percent_escaped(self):
+        st = self.st("gate", "DONE", gate={"verdict": "wait", "reasons": ["100% %H:%M"]})
+        line = dash.status_line(self.cfg, st)
+        self.assertIn("100%%", line)
+        self.assertNotIn("%", line.replace("%%", ""))
+        self.assertLessEqual(len(line), 40)
 
     def test_no_line_breaks_from_status(self):
         st = self.st(status="BLOCKED: a\nb\rc")

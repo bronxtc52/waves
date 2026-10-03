@@ -5,9 +5,10 @@
 реальные gh/git не вызываются. Решение (`decide`) — чистая функция над словарём фактов, без I/O:
 её легко проверять и невозможно «случайно» заставить смержить по побочному эффекту.
 
-Любая ошибка сбора — `GateError` с усечённым текстом; вызывающий трактует её как wait с причиной
+Любая ошибка сбора — `GateError` с текстом одной строкой; вызывающий трактует её как wait с причиной
 (сеть, rate limit, временный сбой gh не должны превращаться ни в мердж, ни в провал волны).
-redact текста ошибок делает вызывающий (wab.py), здесь — только усечение.
+Текст ошибок здесь не усекается: вызывающий (wab.py) сначала делает redact полного текста, затем
+режет до ERROR_LIMIT — иначе токен на границе среза ушёл бы обрывком, который шаблон не узнаёт.
 Модуль не импортирует wab: wab импортирует отсюда `plan_problem` и `PLAN_MAX_BYTES`.
 Импорт модуля ничего не запускает и не создаёт файлов.
 """
@@ -19,7 +20,7 @@ import subprocess
 
 PLAN_MAX_BYTES = 1024 * 1024   # waves.md крупнее мегабайта — не план
 RUN_TIMEOUT_SECONDS = 60       # один вызов gh/git дольше — считаем сбоем сбора, а не ждём вечно
-ERROR_LIMIT = 300              # длина текста ошибки в причине вердикта
+ERROR_LIMIT = 300              # длина причины вердикта ПОСЛЕ redact (режет вызывающий)
 NAMES_LIMIT = 5                # сколько имён check-runs перечислять в причине
 PLAN_PREFIX = "plan changed since approval: "
 PR_FIELDS = ("number,state,headRefOid,isDraft,url,mergeCommit,headRepository,"
@@ -34,9 +35,10 @@ class DuplicatePR(GateError):
     """У ветки волны два и больше открытых PR в основном репозитории: какой мерджить — решает человек."""
 
 
-def _cut(text, limit=ERROR_LIMIT):
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+def _line(text):
+    """Текст ошибки одной строкой. НЕ усекается: срез сырого текста оставил бы от токена на границе
+    обрывок короче шаблона redact. Вызывающий сначала вычищает полный текст, потом режет до ERROR_LIMIT."""
+    return " ".join(str(text).split())
 
 
 def default_run(argv):
@@ -47,7 +49,7 @@ def default_run(argv):
     except subprocess.TimeoutExpired:
         raise GateError(f"{argv[0]}: нет ответа за {RUN_TIMEOUT_SECONDS} с")
     except OSError as e:
-        raise GateError(_cut(f"{argv[0]} не запустился: {e.strerror or e}"))
+        raise GateError(_line(f"{argv[0]} не запустился: {e.strerror or e}"))
     return p.returncode, p.stdout, p.stderr
 
 
@@ -60,10 +62,10 @@ def _call(run, argv):
     except subprocess.TimeoutExpired:
         raise GateError(f"{argv[0]}: нет ответа за {RUN_TIMEOUT_SECONDS} с")
     except OSError as e:
-        raise GateError(_cut(f"{argv[0]} не запустился: {e.strerror or e}"))
+        raise GateError(_line(f"{argv[0]} не запустился: {e.strerror or e}"))
     if rc != 0:
         what = " ".join(argv[:3])
-        raise GateError(_cut(f"{what}: код {rc}: {(err or out or '').strip() or 'без текста'}"))
+        raise GateError(_line(f"{what}: код {rc}: {(err or out or '').strip() or 'без текста'}"))
     return out or ""
 
 
@@ -71,7 +73,7 @@ def _json(text, what):
     try:
         return json.loads(text)
     except ValueError as e:
-        raise GateError(_cut(f"{what}: невалидный JSON ({e})"))
+        raise GateError(_line(f"{what}: невалидный JSON ({e})"))
 
 
 # ---------- PR ветки ----------
@@ -136,7 +138,7 @@ def _objects(text):
         try:
             obj, i = dec.raw_decode(text, i)
         except ValueError as e:
-            raise GateError(_cut(f"gh api check-runs: невалидный JSON ({e})"))
+            raise GateError(_line(f"gh api check-runs: невалидный JSON ({e})"))
         out.append(obj)
 
 

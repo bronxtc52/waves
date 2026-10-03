@@ -36,7 +36,7 @@ STYLE = {  # phase/status -> (icon, colour, label)
     "merge_unverified": ("⚠", "bold red", "мердж не подтверждён"),
     "merged": ("✔", "bold green", "смержено"),
 }
-STATUS_LINE_MAX = 80   # строка status-bar tmux
+STATUS_LINE_MAX = 40   # строка status-bar tmux = status-right-length по умолчанию: tmux не обрежет её сам
 
 
 def fmt_dur(sec):
@@ -184,8 +184,8 @@ STATUS_WORDS = {"BLOCKED": "✋ BLOCKED", "RUNNING": "работает", "dead":
 
 
 def status_line(cfg, st):
-    """Короткая строка для status-right tmux: ≤ STATUS_LINE_MAX, одна строка, через redact,
-    «#» удвоена (tmux раскрывает #{…} и #[…] в статусе)."""
+    """Короткая строка для status-right tmux: ≤ STATUS_LINE_MAX, одна строка, через redact;
+    «#» и «%» удвоены (tmux раскрывает #{…}/#[…] и пропускает status-right через strftime)."""
     wave = st.get("current")
     if wave and wave in (st.get("waves") or {}):
         key, _icon, _colour, label = style_for(cfg, st, wave)
@@ -202,10 +202,12 @@ def status_line(cfg, st):
         raw = "wab: нет текущей волны"
     raw = " ".join(wab.redact(raw).split())   # переводы строк и прочие пробельные — в один пробел
     raw = "".join(ch for ch in raw if ch.isprintable())
+    def esc(t):
+        return t.replace("#", "##").replace("%", "%%")
     raw = raw[:STATUS_LINE_MAX]
-    while len(raw.replace("#", "##")) > STATUS_LINE_MAX:
+    while len(esc(raw)) > STATUS_LINE_MAX:   # длина после экранирования; пара ##/%% не разрезается
         raw = raw[:-1]
-    return raw.replace("#", "##")
+    return esc(raw)
 
 
 class TmuxStatus:
