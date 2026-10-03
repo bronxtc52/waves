@@ -1,8 +1,17 @@
 # Журнал изменений
 
-## Не выпущено
+Формат — [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/), версии — [semver](https://semver.org/lang/ru/).
+
+## 0.1.0 — 2026-10-03
 
 ### Добавлено
+- W5: `install.sh` — проверка зависимостей (claude, tmux ≥ 3.2, gh и его авторизация, git ≥ 2.36, python3 ≥ 3.10, модуль rich) с подсказкой, как поставить; все нехватки печатаются разом, код 1. Симлинк `~/.claude/skills/wave-autobot` на каталог клона: повторный запуск ничего не меняет, симлинк в другое место заменяется с сообщением, каталог или файл на этом месте не трогается (ошибка).
+- W5: README — предупреждение про `--permission-mode auto`, роли и модели, установка, быстрый старт за 5 шагов, поля `waves.json` с умолчаниями, команды `wab.py`/`dash.py`/`wab-open`, `keys.tmux` и `Ctrl+\`, ограничения, версии.
+- W5: `examples/` — игрушечная цепочка из двух волн (`waves.md`, `waves.json` с `plan_sha256`, `prompt-W1.md`), проходит `wab.py validate`.
+- W5: офлайн-сквозной тест `tests/test_e2e_offline.py`: настоящие процессы `wab.py launch` и `wab.py watch`, приватный tmux-сокет, подставные `claude` и `gh` (`tests/fakes/`), локальный bare-репозиторий как origin. Сценарии: BLOCKED и ответ, контрольная точка с `/clear` и продолжением по метке, красный CI → `BLOCKED: merge gate`, ожидание мерджа человеком, автозапуск W2, `chain-result.md`; `automerge: true` — ровно один `gh pr merge` на волну.
+- W5: тесты `install.sh` на подставных бинарях (`tests/test_install.py`) и проверка `examples/`, README и согласованности версии (`tests/test_examples.py`).
+- W5: CI ставит tmux на ubuntu и macOS и задаёт `WAB_E2E_REQUIRED=1`: без tmux сквозной тест падает, а не пропускается.
+- W5: версия `0.1.0` во frontmatter `SKILL.md`.
 - W4: гейт мерджа по фактам GitHub (`scripts/gate.py`): PR ветки волны без форков, HEAD волны = HEAD PR, чистое дерево, все check-runs строго `success` (с пагинацией и сверкой `total_count`), пин плана на каждом такте; чистое решение wait/fail/pass/merged. Отказ — `BLOCKED: merge gate: <причина>` в `status` и причина в окно волны.
 - W4: фаза `awaiting_merge` — при `automerge: false` (по умолчанию) волна после пройденного гейта ждёт мерджа человеком, событие «ждёт мерджа PR #N» один раз.
 - W4: `automerge: true` — ровно один `gh pr merge --squash --match-head-commit <sha>`; запись о мердже сохраняется до вызова, повторного мерджа того же sha нет; черновик PR переводится в ready, план сверяется прямо перед мерджем.
@@ -18,6 +27,22 @@
 - W3: тесты redact по классам пропусков (`tests/fixtures/redact_classes.json`), контрольные обычные фразы и время на 300 КБ входа.
 - W3: тесты на перенесённое из прототипа поведение: `wait_ready` по сроку, неготовое окно при `launch`, DONE и мёртвая сессия, дедупликация BLOCKED, перезапуск `watch` в фазах running и checkpoint, многострочное событие, дашборд при гонке чтения.
 - W3: `redact` явно описан как best-effort (README, SKILL): шаблоны скрывают известные формы, полноту не гарантируют.
+- W2: роли по моделям в `waves.json → roles` (architect, coder, tester, reviewer, reader) с умолчаниями `fable`/`opus`/`sonnet`/`fable`/`haiku` и `fallback_model` (по умолчанию `opus`).
+- W2: субагенты волны `wave-tester`, `wave-reviewer`, `wave-reader` на моделях ролей передаются только в сессию волны флагом `claude --agents`; `~/.claude/agents` не трогается.
+- W2: запуск волны: `claude --model <coder> --permission-mode auto --append-system-prompt-file <PROTOCOL.md + «Контекст волны»> --agents … --disallowedTools AskUserQuestion`.
+- W2: проверка моделей коротким `claude -p` с кэшем в state; недоступная модель заменяется на `fallback_model` с событием ровно один раз, недоступный fallback — отказ запуска; команда `wab.py models <waves.json> [--refresh]`.
+- W2: `PROTOCOL.md` — сценарий волны: красный тест → реализация → `wave-tester` → `wave-reviewer` (не больше двух кругов) → PR → `DONE`; вопрос человеку — только `BLOCKED:` в файле статуса.
+- W2: `SKILL.md` — фаза A на модели `roles.architect`, шаблон `waves.md`, схема `waves.json`, команды через каталог скилла `$WAB`.
+- W2: дашборд показывает роли и пометку fallback.
+- W1: каркас: `scripts/wab.py` (диспетчер), `scripts/dash.py` (дашборд на rich), `scripts/wab-open`, `keys.tmux`, `PROTOCOL.md`, `docs/SPEC.md`, лицензия MIT.
+- W1: CI GitHub Actions — ubuntu и macOS × Python 3.10 и 3.12, права только на чтение.
+- W1: строгий загрузчик `waves.json` v1 (`scripts/waves_config.py`) и команда `wab.py validate`: обязательные поля и умолчания, лишние и дублирующиеся ключи, форматы имён (ветка git, tmux), зависимости только на волны выше.
+- W1: рабочая копия волны — `git worktree` на ветке `wab/<chain>/<run_id>/<волна>` от свежего `origin/<base_branch>`: переиспользование и восстановление, отказ на симлинке, файле, чужом репозитории и заблокированном worktree.
+- W1: `launch` отказывает, пока идёт другая волна, и резервирует волну под блокировкой прогона.
+- W1: `watch` на ходу применяет только пороги `ctx_limit`, `idle_minutes`, `tick_seconds`; смена остальных полей — событие.
+- W1: вычистка текста волны (`redact`) в событиях, статусе и дашборде.
+- W1: `wab-open` открывает окно волны на сокете текущего tmux.
+- W1: тест на отсутствие следов приватной инфраструктуры в репозитории.
 
 ### Исправлено
 - W4: `probe_model` падал с `UnicodeEncodeError`/`UnicodeDecodeError` в не-UTF-8 локали (`LC_ALL=C` без UTF-8 mode); вывод `claude` читается как UTF-8 с заменой, промпт в argv кодируется явно.
@@ -54,3 +79,8 @@
 - W3: текст продолжения после `/clear` (с меткой волны) пишется в `continue-prompt.md` каталога волны до отправки `/clear`; сообщения BLOCKED (resuming, окно не готово после `/clear`) и событие о ненайденной за `AWAIT_SESSION_MINUTES` сессии называют файл и метку: при ручном продолжении без метки новая сессия не привяжется.
 - W3: `TranscriptCache` после сброса по несовпадению начала читал хеш середины файла, и повторное переписывание на месте без смены размера не замечалось; теперь чтение начала всегда с нуля.
 - W3: FIFO на месте `waves.md` вешал `launch` в `open()`; теперь открытие неблокирующее, не обычный файл — `BLOCKED: plan changed since approval`.
+- W2: тесты дашборда падали без установленного rich (CI): заглушки rich в тестах принимают аргументы.
+
+### Известные ограничения
+- Изоляции волны нет: `git worktree` и feature-ветка — порядок работы, а не ограничение прав; базовую ветку защищает только защита ветки на GitHub (см. README).
+- Прочие ограничения — README, раздел «Ограничения».

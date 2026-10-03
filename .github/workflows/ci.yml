@@ -20,5 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - name: tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+      - name: Версия tmux
+        run: tmux -V
       - name: Тесты
+        # без tmux сквозной тест (tests/test_e2e_offline.py) падает, а не пропускается; rich не ставим —
+        # дашборд проверяется на заглушках
+        env:
+          WAB_E2E_REQUIRED: "1"
         run: python3 -m unittest discover -s tests -v
