@@ -16,7 +16,7 @@ import waves_config
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EX = ROOT / "examples"
 README = (ROOT / "README.md").read_text(encoding="utf-8")
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 class TestExamples(unittest.TestCase):

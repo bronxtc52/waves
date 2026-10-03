@@ -379,6 +379,7 @@ def safe_render(cfg):
 
 
 def main():
+    wab.ignore_quit()  # Ctrl+\\ без привязки не роняет дашборд (SIGQUIT)
     if len(sys.argv) != 2:
         sys.exit("использование: dash.py <waves.json>")
     try:

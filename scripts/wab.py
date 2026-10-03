@@ -29,6 +29,7 @@ import os
 import pathlib
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -1877,7 +1878,16 @@ def build_parser():
     return p
 
 
+def ignore_quit():
+    """Ctrl+\\ в панели tmux без привязки (или когда привязка Ctrl+\\ отдаёт клавишу панели) — это
+    SIGQUIT процессу на переднем плане: watch и dash умирали вместе с сессией tmux (живой прогон
+    2026-10-03, EXIT=131). Длинные процессы скилла этот сигнал игнорируют; Ctrl+C работает как прежде."""
+    if hasattr(signal, "SIGQUIT"):
+        signal.signal(signal.SIGQUIT, signal.SIG_IGN)
+
+
 def main(argv=None):
+    ignore_quit()
     # вывод не должен падать на кодировке терминала (ascii, C-локаль)
     for stream in (sys.stdout, sys.stderr):
         try:
