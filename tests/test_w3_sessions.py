@@ -282,6 +282,39 @@ class TestTickAwaitSession(_Tmp):
         self.assertEqual(w["phase"], "running")   # старый огромный журнал больше не меряется
         self.assertEqual(self.sent, [])
 
+    # --- G: у ожидания новой сессии есть срок (AWAIT_SESSION_MINUTES) ---
+    def events(self):
+        f = self.cfg["run_dir"] / "events.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def test_await_timeout_one_event_no_phase_change(self):
+        st = self.st(await_at=time.time() - (wab.AWAIT_SESSION_MINUTES + 1) * 60)
+        w = self.tick(st)
+        self.assertIn(f"новая сессия не найдена по метке за {wab.AWAIT_SESSION_MINUTES} мин", self.events())
+        self.assertIn("контекст не меряется, контрольная точка не запрашивается", self.events())
+        self.assertIn("tmux attach -t =wab-demo-W1", self.events())
+        self.assertEqual((w["phase"], w["tokens"], w["await_session"]), ("running", 123, True))
+        self.assertEqual(self.sent, [])
+        self.tick(st)
+        self.assertEqual(self.events().count("не найдена по метке"), 1)   # once_per: без повтора
+
+    def test_await_within_deadline_silent(self):
+        self.tick(self.st(await_at=time.time() - 60))
+        self.assertNotIn("не найдена по метке", self.events())
+
+    def test_await_timeout_then_found_binds_as_usual(self):
+        st = self.st(await_at=time.time() - 3600)
+        self.tick(st)
+        self.journal("new", [user(f"{MARK} продолжаем"), assistant(0, 0, 4000)], mtime=2000)
+        w = self.tick(st)
+        self.assertEqual((w["sessions"], w["await_session"], w["tokens"]), (["old", "new"], False, 4000))
+        self.assertIn("новая сессия привязана по метке", self.events())
+
+    def test_await_without_await_at_starts_clock(self):
+        w = self.tick(self.st())   # старое состояние без await_at: срок отсчитывается с этого тика
+        self.assertIsInstance(w.get("await_at"), float)
+        self.assertNotIn("не найдена по метке", self.events())
+
 
 class TestLaunchSession(unittest.TestCase):
     def setUp(self):

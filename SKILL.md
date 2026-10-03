@@ -47,13 +47,15 @@ WAB="${WAB:-$HOME/.claude/skills/wave-autobot}"
    `waves[{id, title, goal, done_when, check, depends_on}]`, `roles`
    (architect, coder, tester, reviewer, reader), `fallback_model`, `base_branch`, `automerge`,
    `ctx_limit`, `idle_minutes`, `tick_seconds`, `plan_sha256`. В `plan_sha256` — sha256
-   одобренного `waves.md` (`sha256sum waves.md`). Проверка:
+   одобренного `waves.md` (`sha256sum waves.md`); `launch` сверяет его с `waves.md` рядом с
+   `waves.json` и при расхождении не стартует (`BLOCKED: plan changed since approval`). Проверка:
    `python3 "$WAB"/scripts/wab.py validate waves.json`.
 5. **Запуск:**
    - `python3 "$WAB"/scripts/wab.py models waves.json` — проверить доступность моделей ролей
      (недоступная заменяется на `fallback_model`; `--refresh` проверяет заново);
    - `python3 "$WAB"/scripts/wab.py launch waves.json W1 prompt-W1.md` — запустить волну;
-   - `python3 "$WAB"/scripts/wab.py watch waves.json` — следить до `DONE`;
+   - `python3 "$WAB"/scripts/wab.py watch waves.json` — следить до `DONE` (второй `watch` на тот же
+     прогон не стартует: блокировка `dispatcher.lock`);
    - `python3 "$WAB"/scripts/dash.py waves.json` — дашборд, в отдельном окне tmux.
 
 ## Фаза B — ход волн

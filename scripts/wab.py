@@ -48,6 +48,7 @@ CLEAR_SETTLE_SECONDS = 6       # пауза прототипа, проверен
 PROBE_TIMEOUT_SECONDS = 120    # проверка модели: один короткий `claude -p`
 RUN_LOCK_TIMEOUT_SECONDS = 30  # дольше блокировку прогона не ждём: зависший wab.py не вешает launch навсегда
 MIN_TMUX = (3, 2)              # new-session -e (3.2+)
+AWAIT_SESSION_MINUTES = 10     # столько ждём журнал новой сессии по метке, потом предупреждаем (поиск не прекращается)
 READY_AFTER_CLEAR_SECONDS = 90 # сколько окно может не становиться готовым после /clear
 TAIL_BYTES = 4_000_000         # контекст меряется по последним 4 МБ журнала
 FIRST_MESSAGE_BYTES = 256 * 1024
@@ -467,19 +468,30 @@ _REDACT = [
     re.compile(r"AKIA[0-9A-Z]{16}\b"),
     re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
     re.compile(r"\d{6,}:[A-Za-z0-9_-]{30,}\b"),                         # токен бота
-    # Поле-секрет: имя видно, значение скрыто. Имя может стоять в кавычках (JSON, словарь
-    # Python: {"password": "x"}, 'token': 'x') — закрывающая кавычка входит в группу 2 вместе
-    # с разделителем. Значение в кавычках скрывается целиком, с пробелами внутри; без кавычек —
-    # до пробела целиком (запятые внутри тоже), с конца отбрасываются только завершающие
-    # «,)]}» разметки. Жадный \S* с откатом на хвосте линеен — без вложенных повторов.
-    # Слово «token» без разделителя не трогается.
-    re.compile(r"(?i)(password|passwd|pwd|secret|token|api[_-]?key|dsn|"
-               r"connection[_-]?string|accountkey|sharedaccesskey)\b([\"']?\s*[:=]\s*)"
-               r"(?:\"[^\"]*\"?|'[^']*'?|\S*[^\s,)\]}])"),
+    # Поле-секрет: имя видно, значение скрыто. Имя может быть составным (SECRET_KEY,
+    # AWS_SECRET_ACCESS_KEY, db_password, password_hash, x-api-key) и стоять в кавычках, в том числе
+    # экранированных (JSON внутри строки: \"password\": \"x\"); разделитель — «:», «=» или «=>» (PHP).
+    # Закрывающая кавычка имени входит в группу 2 вместе с разделителем. Значение в кавычках скрывается
+    # целиком, с пробелами и экранированными кавычками внутри; без кавычек — до пробела целиком
+    # (запятые внутри тоже), с конца отбрасываются только завершающие «,)]}» разметки.
+    # Линейность: имя якорится слева (?<![A-Za-z0-9_-]) — на длинной строке из букв пробуется один старт,
+    # а не каждая позиция; в значениях альтернативы не пересекаются по первому символу.
+    # Слово «token» без разделителя и «tokens: 12» не трогаются: после ключевого слова допустимы только
+    # суффиксы _key/_hash/…, а затем \b.
+    re.compile(r"(?i)(?<![A-Za-z0-9_-])"
+               r"([A-Za-z0-9_-]*(?:password|passwd|pwd|secret|token|api[_-]?key|private[_-]?key|passphrase|dsn|"
+               r"connection[_-]?string|accountkey|sharedaccesskey)"
+               r"(?:[_-](?:key|hash|secret|value|token|access|digest|salt))*)\b"
+               r"(\\?[\"']?\s*(?:=>|[:=])\s*)"
+               r"(?:\\\"(?:[^\"\\]|\\(?!\"))*(?:\\\")?|\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|\S*[^\s,)\]}])"),
+    # флаг командной строки со значением через пробел: --password x, --api-key "a b"
+    re.compile(r"(?i)(?<![A-Za-z0-9_-])(--[A-Za-z0-9-]*(?:password|passwd|pwd|secret|token|api-?key|private-?key|"
+               r"passphrase)(?:-(?:key|hash|secret|value|token|digest|salt))*)(?=\s)(\s+)"
+               r"(?:\"(?:[^\"\\]|\\.)*\"?|'(?:[^'\\]|\\.)*'?|(?!-)\S+)"),
     re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*:\s*)(?:(?:bearer|basic|token|digest)\s+)?\S+"),
     re.compile(r"(?i)\b(bearer|basic)(\s+)[A-Za-z0-9._~+/=-]{8,}"),
     re.compile(r"(?<=://)[^/\s:@]+:[^/\s@]+(?=@)"),                    # логин:пароль в URL
-    re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                      # адреса почты
+    re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),         # адреса почты (якорь слева: линейно)
     re.compile(r"\+\d[\d ()-]{8,}\d"),                                  # телефоны (+7 …)
     re.compile(r"\b[A-Za-z0-9+/_]{40,}={0,2}"),                          # длинные непрозрачные строки
 ]
@@ -1191,6 +1203,7 @@ def tick(cfg, st, waves_json=None):
         w["restarts"] += 1
         w["phase"] = "running"
         w["await_session"] = True  # новый журнал привязывается по метке на следующих тиках
+        w["await_at"] = time.time()
         w["checkpoint_at"] = None
         w.pop("clear_at", None)
         w.pop("clear_sent", None)
@@ -1213,8 +1226,14 @@ def tick(cfg, st, waves_json=None):
         if sid:
             w.setdefault("sessions", []).append(sid)
             w["await_session"] = awaiting = False
+            w.pop("await_at", None)
             event(cfg, f"{wave}: новая сессия привязана по метке")
             save_state(cfg, st)
+        else:
+            started = w.setdefault("await_at", now)  # состояние без метки времени: срок идёт с этого тика
+            if now - started > AWAIT_SESSION_MINUTES * 60 and once_per(w, "await_timeout", str(started)):
+                event(cfg, f"{wave}: новая сессия не найдена по метке за {AWAIT_SESSION_MINUTES} мин: "
+                           f"контекст не меряется, контрольная точка не запрашивается; {attach}")
     if awaiting:
         tokens = w.get("tokens", 0)  # старый журнал не меряем: контрольную точку не запрашиваем
     else:

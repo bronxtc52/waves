@@ -96,3 +96,59 @@ class TestRedactPaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------- W3: классы пропусков (фикстура), контрольные фразы, время ----------
+
+import json
+import time
+
+FIXTURE = json.loads((pathlib.Path(__file__).parent / "fixtures" / "redact_classes.json").read_text(encoding="utf-8"))
+
+
+class TestRedactClasses(unittest.TestCase):
+    def test_every_example_hidden(self):
+        for cls, examples in FIXTURE.items():
+            if cls == "plain":
+                continue
+            for ex in examples:
+                with self.subTest(cls=cls, text=ex["text"]):
+                    out = wab.redact(ex["text"], limit=10_000)
+                    self.assertNotIn(ex["secret"], out)
+                    self.assertIn("[скрыто]", out)
+
+    def test_plain_phrases_untouched(self):
+        for text in FIXTURE["plain"]:
+            with self.subTest(text=text):
+                self.assertEqual(wab.redact(text, limit=10_000), text)
+
+    def test_names_stay_visible_and_neighbours_survive(self):
+        out = wab.redact(r'{\"user\": \"bob\", \"password\": \"Hunter2Secret\", \"n\": 1}', limit=10_000)
+        self.assertIn(r'\"user\": \"bob\"', out)
+        self.assertIn("password", out)
+        self.assertIn(r'\"n\": 1', out)
+        self.assertEqual(wab.redact("mysql --user bob --password Hunter2Secret --host db", limit=10_000),
+                         "mysql --user bob --password [скрыто] --host db")
+
+
+class TestRedactLinear(unittest.TestCase):
+    """Шаблоны не должны вести себя квадратично: до W3 300 КБ без «@» занимали ~115 с."""
+
+    def timed(self, text):
+        t = time.monotonic()
+        wab.redact(text, limit=10_000)
+        return time.monotonic() - t
+
+    def test_300kb_without_at(self):
+        self.assertLess(self.timed("word.another-one_x " * 16_000), 1.0)
+        self.assertLess(self.timed("a.b-c+d" * 43_000), 1.0)
+
+    def test_300kb_single_letter_string(self):
+        self.assertLess(self.timed("a" * 300_000), 1.0)
+        self.assertLess(self.timed("abcdefghij" * 30_000), 1.0)
+
+    def test_300kb_many_at_and_prefix_repeats(self):
+        self.assertLess(self.timed("a@" * 150_000), 1.0)
+        self.assertLess(self.timed("sk-" * 100_000), 1.0)
+        self.assertLess(self.timed("a_" * 150_000), 1.0)
+        self.assertLess(self.timed("x-" * 150_000 + "password"), 1.0)
