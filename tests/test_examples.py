@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 import unittest
@@ -59,8 +60,42 @@ class TestReadme(unittest.TestCase):
         head = "\n".join(README.splitlines()[:15])
         self.assertIn("--permission-mode auto", head)
         self.assertIn("automerge", head)
-        self.assertIn("feature-ветке", head)
         self.assertNotIn("🚧", README)
+
+    def test_warning_is_honest_about_isolation(self):
+        """worktree и feature-ветка — порядок работы, не ограничение прав: README не обещает изоляцию."""
+        head = "\n".join(README.splitlines()[:25])
+        self.assertIn("feature-ветка", head)
+        self.assertIn("не ограничение прав", head)
+        self.assertIn("защиту базовой ветки на GitHub", head)
+        self.assertNotIn("сама не пишет", README)
+        skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("только feature-ветки", skill)
+        self.assertIn("не\nограничение прав", skill)
+
+    def test_wab_open_example_keeps_quotes_inside_value(self):
+        """keys.tmux исполняет @wab_open через sh -c: кавычки вокруг путей должны попасть в значение."""
+        lines = [l for l in README.splitlines() if l.startswith("tmux set -g @wab_open ")]
+        self.assertEqual(len(lines), 1)
+        argv = shlex.split(lines[0])  # так команду разберёт оболочка пользователя
+        self.assertEqual(argv[:4], ["tmux", "set", "-g", "@wab_open"])
+        self.assertEqual(len(argv), 5)
+        value = argv[4]
+        self.assertTrue(value.startswith('"') and value.endswith('"'), value)
+        self.assertNotIn("$", value)
+        # sh -c разберёт значение в ровно два слова: wab-open и waves.json, даже с пробелами в путях
+        spaced = value.replace("/путь/к/репозиторию", "/мой репо").replace("/home/вы", "/home/my user")
+        words = shlex.split(spaced)
+        self.assertEqual(len(words), 2, words)
+        self.assertTrue(words[0].endswith("/scripts/wab-open"))
+        self.assertTrue(words[1].endswith("/waves.json"))
+
+    def test_blocked_step_uses_switch_client_inside_tmux(self):
+        """На шаге BLOCKED пользователь уже в tmux: attach изнутри tmux отказывает."""
+        self.assertIn("switch-client -t =wab-hello-w1", README)
+        self.assertIn("switch-client -t =wab`", README)
+        self.assertIn("Ctrl-b L", README)
+        self.assertRegex(README, r"вне tmux — `tmux attach -t =wab-hello-w1`")
 
     def test_quick_start_commands_reference_existing_files(self):
         self.assertIn("./install.sh", README)
