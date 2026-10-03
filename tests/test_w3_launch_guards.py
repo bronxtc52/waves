@@ -336,6 +336,42 @@ class TestSendingWindow(_InterruptedBase):
         self.assertIn("tmux attach -t =wab-demo-w1", msg)
         self.assertIn("first-prompt.md", msg)
 
+    def _to_not_ready(self):
+        self.journal("совсем другое сообщение")
+        self.assertTrue(self.tick())
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "not_ready")
+
+    def test_relaunch_after_sending_to_not_ready_has_no_kill_advice(self):
+        self.st["waves"]["W1"]["prompt_maybe_sent"] = True
+        self._to_not_ready()
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        msg = str(cm.exception)
+        self.assertNotIn("kill-session", msg)
+        self.assertIn("first-prompt.md", msg)
+
+    def test_legacy_sending_without_flag_gets_flag_and_no_kill_advice(self):
+        self._to_not_ready()
+        self.assertTrue(self.st["waves"]["W1"].get("prompt_maybe_sent"))
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        self.assertNotIn("kill-session", str(cm.exception))
+
+    def test_agent_status_not_overwritten_and_leads_to_running(self):
+        wdir = wab.wave_path(self.cfg, "W1")
+        wdir.mkdir(parents=True, exist_ok=True)
+        (wdir / "status").write_text("RUNNING\n", encoding="utf-8")
+        self.assertTrue(self.tick())
+        self.assertEqual(self.st["waves"]["W1"]["phase"], "running")
+        self.assertEqual((wdir / "status").read_text(encoding="utf-8").strip(), "RUNNING")
+        self.assertNotIn("BLOCKED", self.log())
+
+    def test_starting_still_advises_kill_in_check_launchable(self):
+        self.st["waves"]["W1"]["phase"] = "starting"
+        with self.assertRaises(SystemExit) as cm:
+            wab._check_launchable(self.cfg, self.st, "W1", "wab-demo-w1")
+        self.assertIn("kill-session", str(cm.exception))
+
     def test_starting_unchanged(self):
         self.st["waves"]["W1"]["phase"] = "starting"
         self.assertTrue(self.tick())
@@ -350,6 +386,7 @@ class TestLaunchSendingPhase(_Base):
         def fake_send(name, text):
             seen["phase"] = wab.load_state(self.cfg)["waves"]["W1"]["phase"]
             seen["file"] = (wab.wave_path(self.cfg, "W1") / "first-prompt.md").exists()
+            seen["flag"] = wab.load_state(self.cfg)["waves"]["W1"].get("prompt_maybe_sent") is True
 
         pt = helpers.stub_ensure_roles(wab)
         pt.start()
@@ -363,7 +400,7 @@ class TestLaunchSendingPhase(_Base):
             self.addCleanup(p.stop)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(wab.launch(self.cfg, "W1", str(self.prompt)))
-        self.assertEqual(seen, {"phase": "sending", "file": True})
+        self.assertEqual(seen, {"phase": "sending", "file": True, "flag": True})
         self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "running")
 
 
