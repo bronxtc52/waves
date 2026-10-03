@@ -286,6 +286,21 @@ class TestAutomerge(_Flow):
         self.assertEqual([c for c in self.gh.calls if c[:3] in (["gh", "pr", "ready"], ["gh", "pr", "merge"])], [])
         self.assertTrue(self.status().startswith("BLOCKED: plan changed since approval:"))
 
+    def test_plan_changed_during_ready_no_merge(self):
+        self.pin_plan()
+        self.gh.draft = True
+        orig = Gh.__call__
+
+        def gh(argv):
+            if argv[:3] == ["gh", "pr", "ready"]:   # сетевой вызов между ранней проверкой и мерджем
+                (self.dir / "waves.md").write_bytes(b"plan v2\n")
+            return orig(self.gh, argv)
+        self.m_gate_run.side_effect = gh
+        self.tick("DONE")
+        self.assertEqual(self.gh.merges(), [])
+        self.assertTrue(self.status().startswith("BLOCKED: plan changed since approval:"), self.status())
+        self.assertNotIn("merge", self.w())
+
     def test_draft_is_readied_first(self):
         self.gh.draft = True
         self.tick("DONE")
@@ -587,23 +602,62 @@ class TestPendingLaunch(_Flow):
         return wdir
 
     def test_crash_after_merge_save_restart_launches_once(self):
-        """Остановка сразу после сохранения «волна смержена»: намерение перехода уже на диске."""
+        """Остановка сразу после сохранения «волна смержена»: намерение перехода уже на диске,
+        окно прошлой волны уже закрыто (/exit ушёл до сохранения)."""
         self.merged_w1_on_disk()
+        real_event = wab.event
 
-        def crash(*a, **k):
-            raise RuntimeError("диспетчер убит")
-        self.m_send_keys.side_effect = crash   # /exit — первое действие после сохранения
-        with self.assertRaises(RuntimeError):
+        def crash_on_merged_event(cfg, text, trusted=""):
+            if "смержен (" in text:   # первое действие после завершающего сохранения
+                raise RuntimeError("диспетчер убит")
+            return real_event(cfg, text, trusted)
+        with mock.patch.object(wab, "event", side_effect=crash_on_merged_event), self.assertRaises(RuntimeError):
             self.run_watch()
         saved = wab.load_state(self.cfg)
         self.assertIsNone(saved["current"])
         self.assertEqual(saved["waves"]["W1"]["phase"], "merged")
         self.assertEqual(saved["pending_launch"]["wave"], "W2")
-        self.m_send_keys.side_effect = lambda *a, **k: None
+        self.assertIn(("wab-demo-w1", "-l", "/exit"), self.keys)
         self.m_launch.side_effect = self.reserve
         self.run_watch()
         self.m_launch.assert_called_once()
         self.assertEqual(wab.load_state(self.cfg)["current"], "W2")
+
+    def test_exit_sent_before_completing_save(self):
+        """Инвариант: /exit уходит ДО сохранения, которое завершает волну (merged, current=None)."""
+        self.merged_w1_on_disk()
+        real_save = wab.save_state
+        exit_before = []
+
+        def save(cfg, st):
+            if (st.get("waves", {}).get("W1") or {}).get("phase") == "merged" and not exit_before:
+                exit_before.append(("wab-demo-w1", "-l", "/exit") in self.keys)
+            return real_save(cfg, st)
+        self.m_launch.side_effect = self.reserve
+        with mock.patch.object(wab, "save_state", side_effect=save):
+            self.run_watch()
+        self.assertEqual(exit_before, [True])
+
+    def test_crash_after_exit_before_save_restart_launches_once(self):
+        self.merged_w1_on_disk()
+
+        def keys(*a, **k):
+            self.keys.append(a)
+            if a[1:] == ("Enter",):
+                raise RuntimeError("диспетчер убит после /exit")
+        self.m_send_keys.side_effect = keys
+        with self.assertRaises(RuntimeError):
+            self.run_watch()
+        saved = wab.load_state(self.cfg)
+        self.assertEqual(saved["current"], "W1")          # завершение не сохранено
+        self.assertNotIn("pending_launch", saved)
+        self.m_send_keys.side_effect = lambda *a, **k: self.keys.append(a)
+        self.alive = False                                 # окно уже закрыто /exit
+        self.m_launch.side_effect = self.reserve
+        self.run_watch()
+        self.m_launch.assert_called_once()
+        self.assertEqual(wab.load_state(self.cfg)["waves"]["W1"]["phase"], "merged")
+        self.assertGreaterEqual(self.keys.count(("wab-demo-w1", "-l", "/exit")), 1)
 
     def test_crash_before_reservation_restart_launches_once(self):
         self.merged_w1_on_disk()

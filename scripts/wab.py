@@ -1312,6 +1312,11 @@ def _automerge(cfg, st, wave, w, pr, now):
         if rc != 0:
             # полный stderr: _gate_fail вычищает его целиком и только потом режет
             return _gate_fail(cfg, st, wave, w, [f"gh pr ready отказал: {gate._line(err or 'без текста')}"], pr, now)
+    # инвариант: пин — непосредственно перед записью merge и `gh pr merge`, без сетевых вызовов между
+    # ними (`gh pr ready` выше мог идти секунды, план за это время могли поменять)
+    plan = gate.plan_problem(cfg)
+    if plan:
+        return _gate_fail(cfg, st, wave, w, [gate.PLAN_PREFIX + plan], pr, now)
     w["merge"] = {"sha": sha, "pr": number, "at": now, "rc": None}
     w["phase"] = "awaiting_merge"
     save_state(cfg, st)   # ДО вызова: упавший здесь диспетчер не смержит повторно
@@ -1368,11 +1373,14 @@ def _verify_merge(cfg, st, wave, w, waves_json):
         st["pending_launch"] = {"wave": ids[idx + 1], "prompt": str(nxt), "after": wave}
     else:
         write_chain_result(cfg, st)   # до сохранения: остановка между ними не теряет итог (повтор перепишет)
+    # инвариант: /exit — ДО сохранения, завершающего волну. Остановка после /exit и до сохранения
+    # оставляет merge_unverified: следующий такт пройдёт тот же путь (повтор /exit безвреден, мёртвое
+    # окно на DONE не делает волну dead). Остановка после сохранения не оставит открытого окна
+    send_keys(w["tmux"], "-l", "/exit", check=False)
+    send_keys(w["tmux"], "Enter", check=False)
     # инвариант: завершение волны и намерение перехода — ОДНО сохранение. Остановка после него
     # не теряет автопродолжение: перезапущенный watch увидит pending_launch
     save_state(cfg, st)
-    send_keys(w["tmux"], "-l", "/exit", check=False)
-    send_keys(w["tmux"], "Enter", check=False)
     event(cfg, f"{wave}: PR #{mp.get('pr')} смержен ({oid[:12]} в origin/{base}), окно волны закрыто")
     if last:
         event(cfg, "цепочка завершена", trusted=f"; итог: {cfg['run_dir'] / 'chain-result.md'}")
