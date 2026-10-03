@@ -399,10 +399,18 @@ class TestChainHumanMerge(_E2E):
         # контекст выше ctl_limit → WAB-CHECKPOINT → HANDOFF_READY → /clear → продолжение по метке
         self.wait_for(lambda: "запрошена контрольная точка" in self.events(), "запрос контрольной точки")
         self.wait_for(lambda: "handoff готов, отправлен /clear" in self.events(), "/clear")
-        self.wait_for(lambda: "новая сессия привязана по метке" in self.events(), "привязка новой сессии")
+        # tick пишет событие в events.log ДО save_state: ждём опубликованного state.json, а не строки журнала.
+        # state.json пишется атомарно (tmp + replace), а self.state() на нечитаемом файле отдаёт пустое состояние
+        self.wait_for(lambda: len(self.wave("W1").get("sessions", [])) == 2
+                      and not self.wave("W1").get("await_session"),
+                      "сохранённое состояние W1 с двумя сессиями")
+        self.assertIn("W1: новая сессия привязана по метке", self.events())
         w1 = self.wave("W1")
         self.assertEqual(len(w1["sessions"]), 2, w1)
         self.assertEqual(w1["restarts"], 1)
+        # подставной claude пишет handoff-next шагом ПОСЛЕ сообщения с меткой, по которому диспетчер
+        # привязывает сессию: привязка не гарантирует, что строка уже в журнале действий
+        self.wait_for(lambda: "handoff-next:часть 2: hello.py" in self.actions("W1"), "чтение handoff новой сессией")
         acts = self.actions("W1")
         self.assertTrue(acts[0].startswith("start:" + w1["sessions"][0]), acts)
         self.assertIn("clear:" + w1["sessions"][1], acts)
